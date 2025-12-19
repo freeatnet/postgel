@@ -1,9 +1,12 @@
 use futures::FutureExt;
 use std::env;
 use std::os::unix::io::{FromRawFd, RawFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast, watch};
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -40,14 +43,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::process::exit(1);
         }
 
+        // Create shutdown signal and active connection tracking
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let active_changed = Arc::new(Notify::new());
+
+        // Spawn idle monitor task
+        let idle_monitor_active = active_connections.clone();
+        let idle_monitor_notify = active_changed.clone();
+        let idle_monitor_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            idle_monitor(
+                idle_monitor_active,
+                idle_monitor_notify,
+                idle_monitor_shutdown,
+            )
+            .await;
+        });
+
         // Spawn a task for each file descriptor
         let mut handles = Vec::new();
         for fd in fds {
-            handles.push(tokio::spawn(handle_listener(fd, backend_path)));
+            let listener_shutdown_rx = shutdown_rx.clone();
+            let listener_active = active_connections.clone();
+            let listener_notify = active_changed.clone();
+            handles.push(tokio::spawn(handle_listener(
+                fd,
+                backend_path,
+                listener_shutdown_rx,
+                listener_active,
+                listener_notify,
+            )));
         }
 
-        // Wait for all listener tasks (they run forever, so this will block indefinitely)
-        // In practice, if a task panics, we'll see the error
+        // Wait for all listener tasks (they will exit when shutdown is signaled)
         for handle in handles {
             if let Err(e) = handle.await {
                 eprintln!("Listener task error: {:?}", e);
@@ -61,6 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn handle_listener(
     fd: RawFd,
     backend_path: &'static str,
+    mut shutdown_rx: watch::Receiver<bool>,
+    active_connections: Arc<AtomicUsize>,
+    active_changed: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Convert raw FD to std::net::TcpListener
     let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
@@ -69,26 +101,105 @@ async fn handle_listener(
     // Convert to Tokio TcpListener
     let listener = TcpListener::from_std(listener)?;
 
-    // Accept connections in a loop (serve forever)
+    // Accept connections in a loop until shutdown is signaled
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                // Spawn a task to handle this connection
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, backend_path).await {
-                        eprintln!("Connection error: {}", e);
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        // Increment active connection count
+                        active_connections.fetch_add(1, Ordering::Relaxed);
+
+                        // Create guard that will decrement on drop
+                        let guard = ActiveConnGuard {
+                            counter: active_connections.clone(),
+                            notify: active_changed.clone(),
+                        };
+
+                        // Spawn a task to handle this connection
+                        tokio::spawn(async move {
+                            let _guard = guard; // Move guard into task
+                            if let Err(e) = handle_connection(stream, backend_path).await {
+                                eprintln!("Connection error: {}", e);
+                            }
+                            // guard is dropped here, decrementing the counter
+                        });
                     }
-                });
+                    Err(e) => {
+                        eprintln!("Failed to accept connection: {}", e);
+                        // Continue accepting even on error
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("Failed to accept connection: {}", e);
-                // Continue accepting even on error
+            _ = shutdown_rx.changed() => {
+                // Shutdown signal received, break out of loop
+                eprintln!("Shutdown signal received, stopping listener");
+                break;
             }
+        }
+    }
+
+    Ok(())
+}
+
+const BUF_SIZE: usize = 1024;
+const IDLE_TIMEOUT_SECS: u64 = 10;
+
+/// RAII guard that tracks active connections
+/// Increments counter on creation, decrements on drop
+struct ActiveConnGuard {
+    counter: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
+        if prev == 1 {
+            // Transitioned from 1 to 0, notify idle monitor
+            self.notify.notify_one();
         }
     }
 }
 
-const BUF_SIZE: usize = 1024;
+/// Idle monitor task that triggers shutdown after 10 seconds of no active connections
+async fn idle_monitor(
+    active_connections: Arc<AtomicUsize>,
+    active_changed: Arc<Notify>,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    loop {
+        // Wait until active connections reach zero
+        while active_connections.load(Ordering::Relaxed) > 0 {
+            active_changed.notified().await;
+        }
+
+        // All connections closed, start idle timer
+        eprintln!(
+            "No active connections, starting {} second idle timer",
+            IDLE_TIMEOUT_SECS
+        );
+
+        // Now wait for 10 seconds, but abort if a connection arrives
+        tokio::select! {
+            _ = sleep(Duration::from_secs(IDLE_TIMEOUT_SECS)) => {
+                // Timer completed - check if still idle
+                if active_connections.load(Ordering::Relaxed) == 0 {
+                    // Still idle after timeout, trigger shutdown
+                    eprintln!("Idle timer expired, shutting down");
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
+                // A connection arrived during the timeout, restart the loop
+                eprintln!("Idle timer cancelled, new connection arrived");
+            }
+            _ = active_changed.notified() => {
+                // A connection arrived, restart the loop
+                eprintln!("Idle timer cancelled, new connection arrived");
+            }
+        }
+    }
+}
 
 async fn handle_connection(
     mut client: tokio::net::TcpStream,
