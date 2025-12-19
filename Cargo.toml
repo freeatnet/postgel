@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+raunch = "1.0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "io-std"] }
+futures = "0.3"
