@@ -36,6 +36,10 @@ struct Cli {
     /// Postgres run directory for Unix sockets (required if --postgres-bin-dir is set)
     #[arg(long)]
     postgres_run_dir: Option<PathBuf>,
+
+    /// Idle timeout in seconds before shutting down (default: 600)
+    #[arg(long, default_value = "600")]
+    idle_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -172,11 +176,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let idle_monitor_active = active_connections.clone();
         let idle_monitor_notify = active_changed.clone();
         let idle_monitor_shutdown = shutdown_tx.clone();
+        let idle_timeout_secs = cli.idle_timeout_secs;
         tokio::spawn(async move {
             idle_monitor(
                 idle_monitor_active,
                 idle_monitor_notify,
                 idle_monitor_shutdown,
+                idle_timeout_secs,
             )
             .await;
         });
@@ -443,7 +449,6 @@ async fn handle_listener(
 }
 
 const BUF_SIZE: usize = 1024;
-const IDLE_TIMEOUT_SECS: u64 = 10;
 
 /// RAII guard that tracks active connections
 /// Increments counter on creation, decrements on drop
@@ -462,11 +467,12 @@ impl Drop for ActiveConnGuard {
     }
 }
 
-/// Idle monitor task that triggers shutdown after 10 seconds of no active connections
+/// Idle monitor task that triggers shutdown after the specified timeout of no active connections
 async fn idle_monitor(
     active_connections: Arc<AtomicUsize>,
     active_changed: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
+    idle_timeout_secs: u64,
 ) {
     loop {
         // Wait until active connections reach zero
@@ -477,12 +483,12 @@ async fn idle_monitor(
         // All connections closed, start idle timer
         eprintln!(
             "No active connections, starting {} second idle timer",
-            IDLE_TIMEOUT_SECS
+            idle_timeout_secs
         );
 
-        // Now wait for 10 seconds, but abort if a connection arrives
+        // Now wait for the specified timeout, but abort if a connection arrives
         tokio::select! {
-            _ = sleep(Duration::from_secs(IDLE_TIMEOUT_SECS)) => {
+            _ = sleep(Duration::from_secs(idle_timeout_secs)) => {
                 // Timer completed - check if still idle
                 if active_connections.load(Ordering::Relaxed) == 0 {
                     // Still idle after timeout, trigger shutdown
