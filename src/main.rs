@@ -68,11 +68,11 @@ async fn handle_listener(
     // Accept connections in a loop (serve forever)
     loop {
         match listener.accept().await {
-            Ok((stream, client_addr)) => {
+            Ok((stream, _)) => {
                 let backend_path_clone = backend_path.clone();
                 // Spawn a task to handle this connection
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, client_addr, backend_path_clone).await {
+                    if let Err(e) = handle_connection(stream, backend_path_clone).await {
                         eprintln!("Connection error: {}", e);
                     }
                 });
@@ -89,9 +89,11 @@ const BUF_SIZE: usize = 1024;
 
 async fn handle_connection(
     mut client: tokio::net::TcpStream,
-    client_addr: std::net::SocketAddr,
     backend_path: Arc<str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Extract client address from the stream
+    let client_addr = client.peer_addr()?;
+
     // Establish connection to upstream Unix socket for each incoming client connection
     let mut backend = match UnixStream::connect(&*backend_path).await {
         Ok(result) => result,
@@ -100,6 +102,8 @@ async fn handle_connection(
             return Ok(()); // Drop client connection gracefully
         }
     };
+
+    eprintln!("Proxy connection opened: client {} -> backend {}", client_addr, backend_path);
 
     // Split both streams into read/write halves
     let (mut client_read, mut client_write) = client.split();
@@ -134,6 +138,8 @@ async fn handle_connection(
             eprintln!("Error writing bytes from backend to client {}: {}", client_addr, err);
         }
     }
+
+    eprintln!("Proxy connection closed: client {} -> backend {}", client_addr, backend_path);
 
     Ok(())
 }
