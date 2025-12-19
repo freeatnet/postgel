@@ -1,7 +1,6 @@
 use futures::FutureExt;
 use std::env;
 use std::os::unix::io::{FromRawFd, RawFd};
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::broadcast;
@@ -18,7 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::process::exit(1);
     }
     let socket_name = &args[1];
-    let backend_path: Arc<str> = Arc::from(args[2].clone());
+    // We leak `backend_path` instead of wrapping it in an Arc to share it with future tasks since
+    // `backend_path` is going to live for the lifetime of the server in all cases.
+    // (This reduces MESI/MOESI cache traffic between CPU cores.)
+    let backend_path: &str = Box::leak(args[2].clone().into_boxed_str());
 
     // Check if running on macOS (launchd is macOS-only)
     #[cfg(not(target_os = "macos"))]
@@ -41,8 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Spawn a task for each file descriptor
         let mut handles = Vec::new();
         for fd in fds {
-            let backend_path_clone = backend_path.clone();
-            handles.push(tokio::spawn(handle_listener(fd, backend_path_clone)));
+            handles.push(tokio::spawn(handle_listener(fd, backend_path)));
         }
 
         // Wait for all listener tasks (they run forever, so this will block indefinitely)
@@ -59,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 async fn handle_listener(
     fd: RawFd,
-    backend_path: Arc<str>,
+    backend_path: &'static str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Convert raw FD to std::net::TcpListener
     let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
@@ -72,10 +73,9 @@ async fn handle_listener(
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let backend_path_clone = backend_path.clone();
                 // Spawn a task to handle this connection
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, backend_path_clone).await {
+                    if let Err(e) = handle_connection(stream, backend_path).await {
                         eprintln!("Connection error: {}", e);
                     }
                 });
@@ -92,13 +92,13 @@ const BUF_SIZE: usize = 1024;
 
 async fn handle_connection(
     mut client: tokio::net::TcpStream,
-    backend_path: Arc<str>,
+    backend_path: &'static str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Extract client address from the stream
     let client_addr = client.peer_addr()?;
 
     // Establish connection to upstream Unix socket for each incoming client connection
-    let mut backend = match UnixStream::connect(&*backend_path).await {
+    let mut backend = match UnixStream::connect(backend_path).await {
         Ok(result) => result,
         Err(e) => {
             eprintln!(
