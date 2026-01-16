@@ -1,632 +1,624 @@
-use clap::Parser;
-use futures::FutureExt;
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
-use std::os::unix::io::{FromRawFd, RawFd};
+use clap::{Parser, Subcommand};
+use postgel::{
+    launchd::LaunchdService, pg_install::PgInstall, pg_instance::PgInstance,
+    project::ProjectRoot, proxy::ProxyConfig, state::Registry, Instance, InstanceId, Link,
+    LinkId,
+};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixStream};
-use tokio::process::Command;
-use tokio::sync::{Notify, broadcast, watch};
-use tokio::time::{Duration, sleep};
+use std::process;
 
-#[derive(Parser, Debug)]
-#[command(name = "postgel-proxy")]
-#[command(about = "PostgreSQL proxy with launchd socket activation")]
+#[derive(Parser)]
+#[command(name = "postgel")]
+#[command(about = "PostgreSQL project manager for local development")]
 struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Manage projects
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
+    /// Manage instances
+    Instance {
+        #[command(subcommand)]
+        command: InstanceCommands,
+    },
+    /// Run the proxy (for launchd or foreground mode)
+    Proxy {
     /// Socket name for launchd activation
     #[arg(short, long)]
     socket_name: String,
-
     /// Backend Unix socket path (required unless using managed Postgres)
     #[arg(short, long)]
     backend_socket: Option<PathBuf>,
-
     /// Postgres binaries directory (enables managed Postgres mode)
-    /// Should contain 'postgres' and 'pg_isready' binaries
     #[arg(long)]
     postgres_bin_dir: Option<PathBuf>,
-
     /// Postgres data directory (required if --postgres-bin-dir is set)
     #[arg(long)]
     postgres_data_dir: Option<PathBuf>,
-
     /// Postgres run directory for Unix sockets (required if --postgres-bin-dir is set)
     #[arg(long)]
     postgres_run_dir: Option<PathBuf>,
-
     /// Idle timeout in seconds before shutting down (default: 600)
     #[arg(long, default_value = "600")]
     idle_timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    /// Initialize a new project
+    Init {
+        /// Don't enable launchd (default: enabled on macOS)
+        #[arg(long)]
+        no_launchd: bool,
+    },
+    /// Show project information
+    Info,
+    /// Output connection environment variables
+    Env {
+        /// Output format
+        #[arg(long, default_value = "sh")]
+        format: String,
+    },
+    /// Unlink project from instance
+    Unlink {
+        /// Also destroy the linked instance
+        #[arg(long)]
+        destroy_instance: bool,
+    },
+    /// Prune dead project links
+    Prune,
+    /// Enable launchd service for this project
+    EnableLaunchd,
+    /// Disable launchd service for this project
+    DisableLaunchd,
+}
+
+#[derive(Subcommand)]
+enum InstanceCommands {
+    /// List all instances
+    List,
+    /// Show instance information
+    Info {
+        /// Instance ID or name
+        id_or_name: String,
+    },
+    /// Run instance in foreground (proxy mode)
+    Run {
+        /// Instance ID or name
+        id_or_name: String,
+    },
+    /// Delete an instance
+    Delete {
+        /// Instance ID or name
+        id_or_name: String,
+        /// Force deletion without confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Prune orphaned instances
+    Prune {
+        /// Remove instances with no links
+        #[arg(long)]
+        orphaned: bool,
+    },
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {}", e);
+        process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Determine if we're in managed-postgres mode
-    let managed_postgres = cli.postgres_bin_dir.is_some()
-        || cli.postgres_data_dir.is_some()
-        || cli.postgres_run_dir.is_some();
-
-    if managed_postgres {
-        // Validate all Postgres args are provided
-        if cli.postgres_bin_dir.is_none()
-            || cli.postgres_data_dir.is_none()
-            || cli.postgres_run_dir.is_none()
-        {
-            eprintln!(
-                "Error: --postgres-bin-dir, --postgres-data-dir, and --postgres-run-dir must all be provided together"
-            );
-            std::process::exit(1);
-        }
-    }
-
-    // Determine backend socket path
-    let backend_path = if let Some(ref path) = cli.backend_socket {
-        path.clone()
-    } else if managed_postgres {
-        // Default to <run_dir>/.s.PGSQL.5432
-        let run_dir = cli.postgres_run_dir.as_ref().unwrap();
-        run_dir.join(".s.PGSQL.5432")
-    } else {
-        eprintln!("Error: --backend-socket is required when not using managed Postgres");
-        std::process::exit(1);
-    };
-
-    // We leak `backend_path` instead of wrapping it in an Arc to share it with future tasks since
-    // `backend_path` is going to live for the lifetime of the server in all cases.
-    // (This reduces MESI/MOESI cache traffic between CPU cores.)
-    let backend_path_str = backend_path.to_string_lossy().to_string();
-    let backend_path: &str = Box::leak(backend_path_str.into_boxed_str());
-
-    // Check if running on macOS (launchd is macOS-only)
-    #[cfg(not(target_os = "macos"))]
-    {
-        eprintln!("Error: launchd socket activation is only available on macOS");
-        std::process::exit(1);
-    }
-
-    // Activate the socket using raunch
-    #[cfg(target_os = "macos")]
-    {
-        let fds = raunch::activate_socket(&cli.socket_name)
-            .map_err(|e| format!("Failed to activate socket '{}': {}", cli.socket_name, e))?;
-
-        if fds.is_empty() {
-            eprintln!(
-                "No file descriptors returned for socket '{}'",
-                cli.socket_name
-            );
-            std::process::exit(1);
-        }
-
-        // Create shutdown signal and active connection tracking
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let active_connections = Arc::new(AtomicUsize::new(0));
-        let active_changed = Arc::new(Notify::new());
-        let postgres_exited_unexpectedly = Arc::new(AtomicBool::new(false));
-
-        // Spawn Postgres if in managed mode
-        let mut postgres_child = None;
-        if managed_postgres {
-            let postgres_bin_dir = cli.postgres_bin_dir.as_ref().unwrap();
-            let postgres_data_dir = cli.postgres_data_dir.as_ref().unwrap();
-            let postgres_run_dir = cli.postgres_run_dir.as_ref().unwrap();
-
-            // Construct paths to postgres binaries
-            let postgres_bin = postgres_bin_dir.join("postgres");
-            let pg_isready_bin = postgres_bin_dir.join("pg_isready");
-
-            eprintln!("Starting managed Postgres instance...");
-
-            // Set locale environment variables to prevent Postgres multithreading error
-            // Postgres requires these to be set when spawned from a multithreaded process
-            let locale = std::env::var("LC_ALL")
-                .or_else(|_| std::env::var("LANG"))
-                .unwrap_or_else(|_| "C".to_string());
-
-            let child = Command::new(&postgres_bin)
-                .arg("-D")
-                .arg(postgres_data_dir)
-                .arg("-c")
-                .arg("listen_addresses=")
-                .arg("-c")
-                .arg(format!(
-                    "unix_socket_directories={}",
-                    postgres_run_dir.display()
-                ))
-                .arg("-k")
-                .arg(postgres_run_dir)
-                .env("LC_ALL", &locale)
-                .env("LANG", &locale)
-                .stderr(std::process::Stdio::inherit())
-                .stdout(std::process::Stdio::inherit())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn Postgres: {}", e))?;
-
-            let pid = child.id().expect("Postgres child should have a PID");
-            eprintln!("Postgres started with PID {}", pid);
-
-            // Wait for Postgres to become ready before accepting connections
-            eprintln!("Waiting for Postgres to become ready...");
-            wait_for_postgres_ready(&pg_isready_bin, postgres_run_dir, shutdown_rx.clone()).await?;
-            eprintln!("Postgres is ready, starting to accept connections");
-
-            // Spawn supervision task
-            let postgres_supervisor_shutdown_rx = shutdown_rx.clone();
-            let postgres_supervisor_shutdown_tx = shutdown_tx.clone();
-            let postgres_supervisor_exited = postgres_exited_unexpectedly.clone();
-            tokio::spawn(async move {
-                supervise_postgres(
-                    child,
-                    postgres_supervisor_shutdown_rx,
-                    postgres_supervisor_shutdown_tx,
-                    postgres_supervisor_exited,
-                )
-                .await;
-            });
-
-            postgres_child = Some(pid);
-        }
-
-        // Spawn idle monitor task
-        let idle_monitor_active = active_connections.clone();
-        let idle_monitor_notify = active_changed.clone();
-        let idle_monitor_shutdown = shutdown_tx.clone();
-        let idle_timeout_secs = cli.idle_timeout_secs;
-        tokio::spawn(async move {
-            idle_monitor(
-                idle_monitor_active,
-                idle_monitor_notify,
-                idle_monitor_shutdown,
+    match cli.command {
+        Commands::Project { command } => handle_project(command).await,
+        Commands::Instance { command } => handle_instance(command).await,
+        Commands::Proxy {
+            socket_name,
+            backend_socket,
+            postgres_bin_dir,
+            postgres_data_dir,
+            postgres_run_dir,
+            idle_timeout_secs,
+        } => {
+            let config = ProxyConfig {
+                socket_name,
+                backend_socket,
+                postgres_bin_dir,
+                postgres_data_dir,
+                postgres_run_dir,
                 idle_timeout_secs,
-            )
-            .await;
-        });
-
-        // Spawn a task for each file descriptor
-        let mut handles = Vec::new();
-        for fd in fds {
-            let listener_shutdown_rx = shutdown_rx.clone();
-            let listener_active = active_connections.clone();
-            let listener_notify = active_changed.clone();
-            handles.push(tokio::spawn(handle_listener(
-                fd,
-                backend_path,
-                listener_shutdown_rx,
-                listener_active,
-                listener_notify,
-            )));
-        }
-
-        // Wait for all listener tasks (they will exit when shutdown is signaled)
-        for handle in handles {
-            if let Err(e) = handle.await {
-                eprintln!("Listener task error: {:?}", e);
-            }
-        }
-
-        // Gracefully shutdown Postgres if it was started
-        if let Some(pid) = postgres_child {
-            eprintln!("Shutting down Postgres (PID {})...", pid);
-            shutdown_postgres(pid).await;
-        }
-
-        // Check if Postgres exited unexpectedly
-        if postgres_exited_unexpectedly.load(Ordering::Relaxed) {
-            eprintln!("Postgres exited unexpectedly, proxy shutting down");
-            return Err("Postgres exited unexpectedly".into());
+                use_launchd: true, // Proxy subcommand is for launchd mode
+                port: None, // Port is managed by launchd
+            };
+            postgel::proxy::run_proxy(config).await?;
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
-/// Wait for Postgres to become ready by polling pg_isready.
-/// Returns Ok(()) when Postgres is ready, or an error if shutdown is requested.
-async fn wait_for_postgres_ready(
-    pg_isready_bin: &PathBuf,
-    postgres_run_dir: &PathBuf,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let check_interval = Duration::from_millis(100);
-    let mut attempt = 0u64;
+async fn handle_project(cmd: ProjectCommands) -> anyhow::Result<()> {
+    match cmd {
+        ProjectCommands::Init { no_launchd } => {
+            let cwd = std::env::current_dir()?;
+            let root = ProjectRoot::find_or_create(&cwd)?;
+            let _config = root.load_config()?;
 
-    loop {
-        // Check if shutdown was requested
-        if *shutdown_rx.borrow() {
-            return Err("Shutdown requested before Postgres became ready".into());
-        }
+            let registry = Registry::load()?;
 
-        // Run pg_isready to check if Postgres is ready
-        // For Unix sockets, pg_isready uses PGHOST or -h with the socket directory
-        let output = Command::new(pg_isready_bin)
-            .arg("-h")
-            .arg(postgres_run_dir)
-            .env("PGHOST", postgres_run_dir)
-            .output()
-            .await;
-
-        match output {
-            Ok(output) if output.status.success() => {
-                // Postgres is ready
-                eprintln!(
-                    "Postgres readiness check succeeded (attempt {})",
-                    attempt + 1
-                );
+            // Check if already linked
+            if let Some(_) = registry.get_link_by_path(root.path()) {
+                eprintln!("Project already linked. Use 'postgel project unlink' to unlink first.");
                 return Ok(());
             }
-            Ok(_) => {
-                // pg_isready returned non-zero, Postgres not ready yet
-                attempt += 1;
-                if attempt.is_multiple_of(50) {
-                    // Log every 5 seconds (50 * 100ms)
-                    eprintln!(
-                        "Postgres not ready yet (attempt {}), continuing to poll...",
-                        attempt
-                    );
-                }
-            }
-            Err(e) => {
-                // Error running pg_isready, log but continue polling
-                eprintln!("Error running pg_isready: {}, continuing to poll...", e);
-            }
-        }
 
-        // Wait before next check, but also check for shutdown
-        tokio::select! {
-            _ = sleep(check_interval) => {
-                // Continue polling
-            }
-            _ = shutdown_rx.changed() => {
-                return Err("Shutdown requested before Postgres became ready".into());
-            }
-        }
-    }
-}
+            // Determine Postgres version
+            let pg_version = _config.postgres_version.as_deref().unwrap_or("postgresql@16");
+            eprintln!("Installing PostgreSQL {}...", pg_version);
 
-/// Supervise Postgres process: if it exits unexpectedly (before shutdown is requested),
-/// trigger proxy shutdown and mark the exit as unexpected.
-async fn supervise_postgres(
-    mut child: tokio::process::Child,
-    mut shutdown_rx: watch::Receiver<bool>,
-    shutdown_tx: watch::Sender<bool>,
-    exited_unexpectedly: Arc<AtomicBool>,
-) {
-    loop {
-        tokio::select! {
-            result = child.wait() => {
-                match result {
-                    Ok(status) => {
-                        // Check if shutdown was already requested
-                        if *shutdown_rx.borrow() {
-                            // Shutdown was requested, this is expected
-                            eprintln!("Postgres exited (expected shutdown)");
-                        } else {
-                            // Unexpected exit
-                            eprintln!("Postgres exited unexpectedly with status: {:?}", status);
-                            exited_unexpectedly.store(true, Ordering::Relaxed);
-                            let _ = shutdown_tx.send(true);
-                        }
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("Error waiting for Postgres: {}", e);
-                        exited_unexpectedly.store(true, Ordering::Relaxed);
-                        let _ = shutdown_tx.send(true);
-                        break;
-                    }
-                }
-            }
-            _ = shutdown_rx.changed() => {
-                // Shutdown requested, check if Postgres already exited
-                if let Ok(Some(status)) = child.try_wait() {
-                    eprintln!("Postgres already exited with status: {:?}", status);
-                    break;
-                }
-                // Continue waiting for Postgres to exit (we'll send SIGTERM from main)
-            }
-        }
-    }
-}
+            let pg_install = PgInstall::get_or_install(pg_version)?;
 
-/// Gracefully shutdown Postgres by sending SIGTERM, waiting up to 10 seconds,
-/// then sending SIGKILL if still running.
-async fn shutdown_postgres(pid: u32) {
-    let nix_pid = Pid::from_raw(pid as i32);
+            // Generate instance name and paths
+            let instance_name = root.generate_instance_name();
+            let instance_id = InstanceId::new();
 
-    // Send SIGTERM
-    match signal::kill(nix_pid, Signal::SIGTERM) {
-        Ok(()) => {
-            eprintln!(
-                "Sent SIGTERM to Postgres (PID {}), waiting up to 10 seconds...",
-                pid
+            let dirs = directories::ProjectDirs::from("dev", "postgel", "postgel")
+                .ok_or_else(|| anyhow::anyhow!("Failed to determine data directory"))?;
+            let data_dir = dirs.data_dir().join("instances").join(&instance_id.0);
+            let run_dir = data_dir.join("run");
+
+            // Find an available port
+            let port = find_available_port()?;
+
+            // Create instance
+            let pg_instance = PgInstance::new(
+                pg_install.bin_dir.clone(),
+                data_dir.clone(),
+                run_dir.clone(),
+                port,
             );
-        }
-        Err(e) => {
-            eprintln!("Failed to send SIGTERM to Postgres (PID {}): {}", pid, e);
-            return;
-        }
-    }
 
-    // Wait up to 10 seconds, checking every 100ms
-    let timeout = Duration::from_secs(10);
-    let check_interval = Duration::from_millis(100);
-    let mut elapsed = Duration::from_secs(0);
+            pg_instance.initdb()?;
 
-    while elapsed < timeout {
-        sleep(check_interval).await;
-        elapsed += check_interval;
+            let instance = Instance {
+                id: instance_id.clone(),
+                display_name: instance_name.clone(),
+                postgres_version: pg_version.to_string(),
+                data_dir: data_dir.clone(),
+                run_dir: run_dir.clone(),
+                port,
+                created_at: chrono::Utc::now(),
+            };
 
-        // Check if process still exists by sending signal 0
-        match signal::kill(nix_pid, None) {
-            Ok(()) => {
-                // Process still exists, continue waiting
+            registry.add_instance(instance.clone())?;
+
+            // Create link
+            let link = Link {
+                id: LinkId::new(),
+                project_path: root.path().to_path_buf(),
+                instance_id: instance_id.clone(),
+                db_name: "postgres".to_string(),
+                db_user: "postgres".to_string(),
+                created_at: chrono::Utc::now(),
+            };
+
+            registry.add_link(link)?;
+
+            eprintln!("Project initialized!");
+            eprintln!("Instance: {} (port {})", instance_name, port);
+
+            // Enable launchd by default on macOS
+            #[cfg(target_os = "macos")]
+            if !no_launchd {
+                enable_launchd_for_instance(&registry, &instance_id, &instance).await?;
             }
-            Err(nix::errno::Errno::ESRCH) => {
-                // Process doesn't exist, it exited
-                eprintln!("Postgres (PID {}) exited gracefully", pid);
-                return;
-            }
-            Err(e) => {
-                // Some other error occurred, log and continue
-                eprintln!("Error checking Postgres (PID {}) status: {}", pid, e);
-            }
+
+            Ok(())
         }
-    }
+        ProjectCommands::Info => {
+            let cwd = std::env::current_dir()?;
+            let root = ProjectRoot::find(&cwd)?;
+            let _config = root.load_config()?;
 
-    // Still running after timeout, send SIGKILL
-    eprintln!(
-        "Postgres (PID {}) did not exit within timeout, sending SIGKILL",
-        pid
-    );
-    match signal::kill(nix_pid, Signal::SIGKILL) {
-        Ok(()) => {
-            eprintln!("Sent SIGKILL to Postgres (PID {})", pid);
+            let registry = Registry::load()?;
+            let link = registry
+                .get_link_by_path(root.path())
+                .ok_or_else(|| anyhow::anyhow!("Project not linked"))?;
+
+            let instance = registry
+                .get_instance(&link.instance_id)
+                .ok_or_else(|| anyhow::anyhow!("Instance not found"))?;
+
+            println!("Project root: {}", root.path().display());
+            println!("Linked instance: {} ({})", instance.display_name, instance.id.0);
+            println!("PostgreSQL version: {}", instance.postgres_version);
+            println!("Port: {}", instance.port);
+            println!("Database: {}", link.db_name);
+            println!("User: {}", link.db_user);
+            println!("Data directory: {}", instance.data_dir.display());
+            println!("Run directory: {}", instance.run_dir.display());
+
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("Failed to send SIGKILL to Postgres (PID {}): {}", pid, e);
-        }
-    }
-}
+        ProjectCommands::Env { format } => {
+            let cwd = std::env::current_dir()?;
+            let root = ProjectRoot::find(&cwd)?;
 
-async fn handle_listener(
-    fd: RawFd,
-    backend_path: &'static str,
-    mut shutdown_rx: watch::Receiver<bool>,
-    active_connections: Arc<AtomicUsize>,
-    active_changed: Arc<Notify>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Convert raw FD to std::net::TcpListener
-    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-    listener.set_nonblocking(true)?;
+            let registry = Registry::load()?;
+            let link = registry
+                .get_link_by_path(root.path())
+                .ok_or_else(|| anyhow::anyhow!("Project not linked"))?;
 
-    // Convert to Tokio TcpListener
-    let listener = TcpListener::from_std(listener)?;
+            let instance = registry
+                .get_instance(&link.instance_id)
+                .ok_or_else(|| anyhow::anyhow!("Instance not found"))?;
 
-    // Accept connections in a loop until shutdown is signaled
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, _)) => {
-                        // Increment active connection count
-                        active_connections.fetch_add(1, Ordering::Relaxed);
+            let database_url = format!(
+                "postgres://{}@127.0.0.1:{}/{}",
+                link.db_user, instance.port, link.db_name
+            );
 
-                        // Create guard that will decrement on drop
-                        let guard = ActiveConnGuard {
-                            counter: active_connections.clone(),
-                            notify: active_changed.clone(),
-                        };
-
-                        // Spawn a task to handle this connection
-                        tokio::spawn(async move {
-                            let _guard = guard; // Move guard into task
-                            if let Err(e) = handle_connection(stream, backend_path).await {
-                                eprintln!("Connection error: {}", e);
-                            }
-                            // guard is dropped here, decrementing the counter
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to accept connection: {}", e);
-                        // Continue accepting even on error
-                    }
+            match format.as_str() {
+                "sh" => {
+                    println!("export PGHOST=127.0.0.1");
+                    println!("export PGPORT={}", instance.port);
+                    println!("export PGUSER={}", link.db_user);
+                    println!("export PGDATABASE={}", link.db_name);
+                    println!("export PGSSLMODE=disable");
+                    println!("export DATABASE_URL=\"{}\"", database_url);
                 }
-            }
-            _ = shutdown_rx.changed() => {
-                // Shutdown signal received, break out of loop
-                eprintln!("Shutdown signal received, stopping listener");
-                break;
-            }
+                "dotenv" => {
+                    println!("PGHOST=127.0.0.1");
+                    println!("PGPORT={}", instance.port);
+                    println!("PGUSER={}", link.db_user);
+                    println!("PGDATABASE={}", link.db_name);
+                    println!("PGSSLMODE=disable");
+                    println!("DATABASE_URL={}", database_url);
+                }
+                "json" => {
+                    let json = serde_json::json!({
+                        "PGHOST": "127.0.0.1",
+                        "PGPORT": instance.port,
+                        "PGUSER": link.db_user,
+                        "PGDATABASE": link.db_name,
+                        "PGSSLMODE": "disable",
+                        "DATABASE_URL": database_url,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+                _ => {
+                    anyhow::bail!("Unknown format: {}. Supported: sh, dotenv, json", format);
         }
     }
 
     Ok(())
 }
+        ProjectCommands::Unlink { destroy_instance } => {
+            let cwd = std::env::current_dir()?;
+            let root = ProjectRoot::find(&cwd)?;
 
-const BUF_SIZE: usize = 1024;
+            let registry = Registry::load()?;
+            let link = registry
+                .get_link_by_path(root.path())
+                .ok_or_else(|| anyhow::anyhow!("Project not linked"))?;
 
-/// RAII guard that tracks active connections
-/// Increments counter on creation, decrements on drop
-struct ActiveConnGuard {
-    counter: Arc<AtomicUsize>,
-    notify: Arc<Notify>,
-}
+            if destroy_instance {
+                let instance = registry
+                    .get_instance(&link.instance_id)
+                    .ok_or_else(|| anyhow::anyhow!("Instance not found"))?;
 
-impl Drop for ActiveConnGuard {
-    fn drop(&mut self) {
-        let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
-        if prev == 1 {
-            // Transitioned from 1 to 0, notify idle monitor
-            self.notify.notify_one();
-        }
-    }
-}
-
-/// Idle monitor task that triggers shutdown after the specified timeout of no active connections
-async fn idle_monitor(
-    active_connections: Arc<AtomicUsize>,
-    active_changed: Arc<Notify>,
-    shutdown_tx: watch::Sender<bool>,
-    idle_timeout_secs: u64,
-) {
-    loop {
-        // Wait until active connections reach zero
-        while active_connections.load(Ordering::Relaxed) > 0 {
-            active_changed.notified().await;
-        }
-
-        // All connections closed, start idle timer
-        eprintln!(
-            "No active connections, starting {} second idle timer",
-            idle_timeout_secs
-        );
-
-        // Now wait for the specified timeout, but abort if a connection arrives
-        tokio::select! {
-            _ = sleep(Duration::from_secs(idle_timeout_secs)) => {
-                // Timer completed - check if still idle
-                if active_connections.load(Ordering::Relaxed) == 0 {
-                    // Still idle after timeout, trigger shutdown
-                    eprintln!("Idle timer expired, shutting down");
-                    let _ = shutdown_tx.send(true);
-                    break;
+                // Remove launchd service
+                #[cfg(target_os = "macos")]
+                {
+                    let label = format!("dev.postgel.{}", instance.id.0);
+                    let service = LaunchdService::new(label);
+                    let _ = service.remove();
                 }
-                // A connection arrived during the timeout, restart the loop
-                eprintln!("Idle timer cancelled, new connection arrived");
+
+                // Remove instance data
+                if instance.data_dir.exists() {
+                    std::fs::remove_dir_all(&instance.data_dir)?;
+                }
+
+                registry.remove_instance(&link.instance_id)?;
             }
-            _ = active_changed.notified() => {
-                // A connection arrived, restart the loop
-                eprintln!("Idle timer cancelled, new connection arrived");
+
+            registry.remove_link(&link.id)?;
+            eprintln!("Project unlinked");
+
+            Ok(())
+        }
+        ProjectCommands::Prune => {
+            let registry = Registry::load()?;
+            let removed = registry.prune_dead_links()?;
+            eprintln!("Removed {} dead link(s)", removed.len());
+            Ok(())
+        }
+        ProjectCommands::EnableLaunchd => {
+            let cwd = std::env::current_dir()?;
+            let root = ProjectRoot::find(&cwd)?;
+
+            let registry = Registry::load()?;
+            let link = registry
+                .get_link_by_path(root.path())
+                .ok_or_else(|| anyhow::anyhow!("Project not linked"))?;
+
+            let instance = registry
+                .get_instance(&link.instance_id)
+                .ok_or_else(|| anyhow::anyhow!("Instance not found"))?;
+
+            #[cfg(target_os = "macos")]
+            {
+                enable_launchd_for_instance(&registry, &link.instance_id, &instance).await?;
             }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("launchd is only available on macOS");
+            }
+
+            Ok(())
+        }
+        ProjectCommands::DisableLaunchd => {
+            let cwd = std::env::current_dir()?;
+            let root = ProjectRoot::find(&cwd)?;
+
+            let registry = Registry::load()?;
+            let link = registry
+                .get_link_by_path(root.path())
+                .ok_or_else(|| anyhow::anyhow!("Project not linked"))?;
+
+            let instance = registry
+                .get_instance(&link.instance_id)
+                .ok_or_else(|| anyhow::anyhow!("Instance not found"))?;
+
+            #[cfg(target_os = "macos")]
+            {
+                let label = format!("dev.postgel.{}", instance.id.0);
+                let service = LaunchdService::new(label);
+                service.remove()?;
+                eprintln!("Launchd service disabled");
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("launchd is only available on macOS");
+            }
+
+            Ok(())
         }
     }
 }
 
-async fn handle_connection(
-    mut client: tokio::net::TcpStream,
-    backend_path: &'static str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Extract client address from the stream
-    let client_addr = client.peer_addr()?;
+async fn handle_instance(cmd: InstanceCommands) -> anyhow::Result<()> {
+    match cmd {
+        InstanceCommands::List => {
+            let registry = Registry::load()?;
+            let instances = registry.list_instances();
+            let links = registry.list_links();
 
-    // Establish connection to upstream Unix socket for each incoming client connection
-    let mut backend = match UnixStream::connect(backend_path).await {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!(
-                "Error establishing upstream connection to {}: {}",
-                backend_path, e
-            );
-            return Ok(()); // Drop client connection gracefully
+            println!("Instances:");
+            for instance in instances {
+                let link_count = links
+                    .iter()
+                    .filter(|l| l.instance_id == instance.id)
+                    .count();
+                println!(
+                    "  {} ({}) - port {}, {} link(s)",
+                    instance.display_name, instance.id.0, instance.port, link_count
+                );
+            }
+            Ok(())
         }
-    };
+        InstanceCommands::Info { id_or_name } => {
+            let registry = Registry::load()?;
+            let instance = find_instance(&registry, &id_or_name)?;
 
-    eprintln!(
-        "Proxy connection opened: client {} -> backend {}",
-        client_addr, backend_path
-    );
+            println!("Instance: {}", instance.display_name);
+            println!("ID: {}", instance.id.0);
+            println!("PostgreSQL version: {}", instance.postgres_version);
+            println!("Port: {}", instance.port);
+            println!("Data directory: {}", instance.data_dir.display());
+            println!("Run directory: {}", instance.run_dir.display());
 
-    // Split both streams into read/write halves
-    let (mut client_read, mut client_write) = client.split();
-    let (mut backend_read, mut backend_write) = backend.split();
+            let links = registry.list_links();
+            let instance_links: Vec<_> = links
+                .into_iter()
+                .filter(|l| l.instance_id == instance.id)
+                .collect();
 
-    // Create a broadcast channel for cancellation
-    let (cancel, _) = broadcast::channel::<()>(1);
+            if !instance_links.is_empty() {
+                println!("\nLinked projects:");
+                for link in instance_links {
+                    println!("  {}", link.project_path.display());
+                }
+            }
 
-    // Run both copy operations concurrently, canceling the other when one finishes
-    let (backend_copied, client_copied) = tokio::join!(
-        copy_with_abort(&mut backend_read, &mut client_write, cancel.subscribe()).then(|r| {
-            let _ = cancel.send(());
-            async { r }
-        }),
-        copy_with_abort(&mut client_read, &mut backend_write, cancel.subscribe()).then(|r| {
-            let _ = cancel.send(());
-            async { r }
-        })
-    );
-
-    // Log results (errors are already handled in copy_with_abort)
-    match client_copied {
-        Ok(count) => {
-            eprintln!(
-                "Transferred {} bytes from client {} to backend",
-                count, client_addr
-            );
+            Ok(())
         }
-        Err(err) => {
-            eprintln!(
-                "Error writing bytes from client {} to backend: {}",
-                client_addr, err
-            );
-        }
-    }
+        InstanceCommands::Run { id_or_name } => {
+            let registry = Registry::load()?;
+            let instance = find_instance(&registry, &id_or_name)?;
 
-    match backend_copied {
-        Ok(count) => {
-            eprintln!(
-                "Transferred {} bytes from backend to client {}",
-                count, client_addr
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "Error writing bytes from backend to client {}: {}",
-                client_addr, err
-            );
-        }
-    }
+            // Get Postgres installation
+            let pg_install = PgInstall::get_or_install(&instance.postgres_version)?;
 
-    eprintln!(
-        "Proxy connection closed: client {} -> backend {}",
-        client_addr, backend_path
-    );
+            let pg_instance = PgInstance::new(
+                pg_install.bin_dir.clone(),
+                instance.data_dir.clone(),
+                instance.run_dir.clone(),
+                instance.port,
+            );
 
+            // Ensure Postgres is initialized
+            pg_instance.initdb()?;
+
+            let config = ProxyConfig {
+                socket_name: format!("postgel-{}", instance.id.0),
+                backend_socket: Some(pg_instance.socket_path()),
+                postgres_bin_dir: Some(pg_instance.bin_dir.clone()),
+                postgres_data_dir: Some(pg_instance.data_dir.clone()),
+                postgres_run_dir: Some(pg_instance.run_dir.clone()),
+                idle_timeout_secs: 600,
+                use_launchd: false, // Foreground mode
+                port: Some(instance.port),
+            };
+
+            eprintln!("Running proxy in foreground mode on port {}...", instance.port);
+            postgel::proxy::run_proxy(config).await?;
+            Ok(())
+        }
+        InstanceCommands::Delete { id_or_name, force } => {
+            let registry = Registry::load()?;
+            let instance = find_instance(&registry, &id_or_name)?;
+
+            let links = registry.list_links();
+            let instance_links: Vec<_> = links
+                .into_iter()
+                .filter(|l| l.instance_id == instance.id)
+                .collect();
+
+            if !instance_links.is_empty() {
+                eprintln!("Warning: This instance is linked to {} project(s):", instance_links.len());
+                for link in &instance_links {
+                    eprintln!("  {}", link.project_path.display());
+                }
+            }
+
+            if !force {
+                eprint!("Delete instance {}? [y/N]: ", instance.display_name);
+                use std::io::{self, Write};
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+            if !input.trim().eq_ignore_ascii_case("y") {
+                eprintln!("Cancelled");
+                return Ok(());
+            }
+        }
+
+            // Remove launchd service
+            #[cfg(target_os = "macos")]
+            {
+                let label = format!("dev.postgel.{}", instance.id.0);
+                let service = LaunchdService::new(label);
+                let _ = service.remove();
+            }
+
+            // Remove instance data
+            if instance.data_dir.exists() {
+                std::fs::remove_dir_all(&instance.data_dir)?;
+            }
+
+            // Remove links
+            for link in instance_links {
+                registry.remove_link(&link.id)?;
+            }
+
+            registry.remove_instance(&instance.id)?;
+            eprintln!("Instance deleted");
+
+            Ok(())
+        }
+        InstanceCommands::Prune { orphaned } => {
+            let registry = Registry::load()?;
+            let instances = registry.list_instances();
+            let links = registry.list_links();
+
+            let mut removed = 0;
+            for instance in instances {
+                let link_count = links
+                    .iter()
+                    .filter(|l| l.instance_id == instance.id)
+                    .count();
+
+                if orphaned && link_count == 0 {
+                    if instance.data_dir.exists() {
+                        std::fs::remove_dir_all(&instance.data_dir)?;
+                    }
+                    registry.remove_instance(&instance.id)?;
+                    removed += 1;
+                } else if !instance.data_dir.exists() {
+                    // Instance data directory is missing
+                    registry.remove_instance(&instance.id)?;
+                    removed += 1;
+                }
+            }
+
+            eprintln!("Removed {} instance(s)", removed);
     Ok(())
+        }
+    }
 }
 
-async fn copy_with_abort<R, W>(
-    read: &mut R,
-    write: &mut W,
-    mut abort: broadcast::Receiver<()>,
-) -> tokio::io::Result<usize>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut copied = 0;
-    let mut buf = [0u8; BUF_SIZE];
-    loop {
-        let bytes_read;
-        tokio::select! {
-            biased;
-
-            result = read.read(&mut buf) => {
-                use std::io::ErrorKind::{ConnectionReset, ConnectionAborted};
-                bytes_read = result.or_else(|e| match e.kind() {
-                    // Consider these to be part of the proxy life, not errors
-                    ConnectionReset | ConnectionAborted => Ok(0),
-                    _ => Err(e)
-                })?;
-            },
-            _ = abort.recv() => {
-                break;
-            }
-        }
-
-        if bytes_read == 0 {
-            break;
-        }
-
-        // While we ignore some read errors above, any error writing data we've already read to
-        // the other side is always treated as exceptional.
-        write.write_all(&buf[0..bytes_read]).await?;
-        copied += bytes_read;
+fn find_instance(registry: &Registry, id_or_name: &str) -> anyhow::Result<Instance> {
+    // Try as ID first
+    let instance_id = InstanceId(id_or_name.to_string());
+    if let Some(instance) = registry.get_instance(&instance_id) {
+        return Ok(instance);
     }
 
-    Ok(copied)
+    // Try as name
+    if let Some(instance) = registry.find_instance_by_name(id_or_name) {
+        return Ok(instance);
+    }
+
+    anyhow::bail!("Instance not found: {}", id_or_name);
+}
+
+fn find_available_port() -> anyhow::Result<u16> {
+    use std::net::TcpListener;
+
+    // Try ports starting from 5432
+    for port in 5432..65535 {
+        if let Ok(_) = TcpListener::bind(format!("127.0.0.1:{}", port)) {
+            // Port is available
+            return Ok(port);
+        }
+    }
+
+    anyhow::bail!("No available port found");
+}
+
+#[cfg(target_os = "macos")]
+async fn enable_launchd_for_instance(
+    _registry: &Registry,
+    _instance_id: &InstanceId,
+    instance: &Instance,
+) -> anyhow::Result<()> {
+    use std::env;
+
+    let label = format!("dev.postgel.{}", instance.id.0);
+    let service = LaunchdService::new(label.clone());
+
+    // Get the binary path
+    let binary_path = env::current_exe()?;
+
+    // Get Postgres bin dir from instance
+    // This is a bit of a hack - we need to reconstruct it
+    let pg_install = PgInstall::get_or_install(&instance.postgres_version)?;
+
+    service.install(
+        &binary_path,
+        "postgres-proxy",
+        &pg_install.bin_dir,
+        &instance.data_dir,
+        &instance.run_dir,
+        instance.port,
+        600,
+    )?;
+
+    eprintln!("Launchd service enabled: {}", label);
+    Ok(())
 }
