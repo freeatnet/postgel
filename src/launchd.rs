@@ -17,6 +17,7 @@ impl LaunchdService {
         Self { label, plist_path }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn install(
         &self,
         binary_path: &Path,
@@ -29,8 +30,7 @@ impl LaunchdService {
     ) -> Result<()> {
         // Create LaunchAgents directory if it doesn't exist
         if let Some(parent) = self.plist_path.parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create LaunchAgents directory")?;
+            fs::create_dir_all(parent).context("Failed to create LaunchAgents directory")?;
         }
 
         let mut dict = plist::Dictionary::new();
@@ -54,17 +54,24 @@ impl LaunchdService {
             idle_timeout_secs.to_string(),
         ];
 
-        dict.insert("ProgramArguments".to_string(), Value::Array(
-            args.into_iter().map(Value::String).collect()
-        ));
+        dict.insert(
+            "ProgramArguments".to_string(),
+            Value::Array(args.into_iter().map(Value::String).collect()),
+        );
 
         // Sockets
         let mut socket_array = Vec::new();
 
         // IPv4 socket
         let mut ipv4_socket = plist::Dictionary::new();
-        ipv4_socket.insert("SockNodeName".to_string(), Value::String("127.0.0.1".to_string()));
-        ipv4_socket.insert("SockServiceName".to_string(), Value::String(port.to_string()));
+        ipv4_socket.insert(
+            "SockNodeName".to_string(),
+            Value::String("127.0.0.1".to_string()),
+        );
+        ipv4_socket.insert(
+            "SockServiceName".to_string(),
+            Value::String(port.to_string()),
+        );
         ipv4_socket.insert("SockType".to_string(), Value::String("stream".to_string()));
         ipv4_socket.insert("SockFamily".to_string(), Value::String("IPv4".to_string()));
         socket_array.push(Value::Dictionary(ipv4_socket));
@@ -72,7 +79,10 @@ impl LaunchdService {
         // IPv6 socket
         let mut ipv6_socket = plist::Dictionary::new();
         ipv6_socket.insert("SockNodeName".to_string(), Value::String("::1".to_string()));
-        ipv6_socket.insert("SockServiceName".to_string(), Value::String(port.to_string()));
+        ipv6_socket.insert(
+            "SockServiceName".to_string(),
+            Value::String(port.to_string()),
+        );
         ipv6_socket.insert("SockType".to_string(), Value::String("stream".to_string()));
         ipv6_socket.insert("SockFamily".to_string(), Value::String("IPv6".to_string()));
         socket_array.push(Value::Dictionary(ipv6_socket));
@@ -89,18 +99,29 @@ impl LaunchdService {
 
         // StandardOutPath and StandardErrorPath
         let log_dir = PathBuf::from("/tmp");
-        dict.insert("StandardOutPath".to_string(), Value::String(
-            log_dir.join(format!("{}.stdout.log", self.label)).to_string_lossy().to_string()
-        ));
-        dict.insert("StandardErrorPath".to_string(), Value::String(
-            log_dir.join(format!("{}.stderr.log", self.label)).to_string_lossy().to_string()
-        ));
+        dict.insert(
+            "StandardOutPath".to_string(),
+            Value::String(
+                log_dir
+                    .join(format!("{}.stdout.log", self.label))
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        );
+        dict.insert(
+            "StandardErrorPath".to_string(),
+            Value::String(
+                log_dir
+                    .join(format!("{}.stderr.log", self.label))
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        );
 
         let plist = Value::Dictionary(dict);
-        
+
         // Write plist to file
-        plist::to_file_xml(&self.plist_path, &plist)
-            .context("Failed to write plist file")?;
+        plist::to_file_xml(&self.plist_path, &plist).context("Failed to write plist file")?;
 
         // Load the service
         self.load()
@@ -150,8 +171,7 @@ impl LaunchdService {
     pub fn remove(&self) -> Result<()> {
         self.unload()?;
         if self.plist_path.exists() {
-            fs::remove_file(&self.plist_path)
-                .context("Failed to remove plist file")?;
+            fs::remove_file(&self.plist_path).context("Failed to remove plist file")?;
         }
         Ok(())
     }

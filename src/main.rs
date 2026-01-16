@@ -1,8 +1,7 @@
 use clap::{Parser, Subcommand};
 use postgel::{
-    launchd::LaunchdService, pg_install::PgInstall, pg_instance::PgInstance,
-    project::ProjectRoot, proxy::ProxyConfig, state::Registry, Instance, InstanceId, Link,
-    LinkId,
+    Instance, InstanceId, Link, LinkId, launchd::LaunchdService, pg_install::PgInstall,
+    pg_instance::PgInstance, project::ProjectRoot, proxy::ProxyConfig, state::Registry,
 };
 use std::path::PathBuf;
 use std::process;
@@ -29,24 +28,24 @@ enum Commands {
     },
     /// Run the proxy (for launchd or foreground mode)
     Proxy {
-    /// Socket name for launchd activation
-    #[arg(short, long)]
-    socket_name: String,
-    /// Backend Unix socket path (required unless using managed Postgres)
-    #[arg(short, long)]
-    backend_socket: Option<PathBuf>,
-    /// Postgres binaries directory (enables managed Postgres mode)
-    #[arg(long)]
-    postgres_bin_dir: Option<PathBuf>,
-    /// Postgres data directory (required if --postgres-bin-dir is set)
-    #[arg(long)]
-    postgres_data_dir: Option<PathBuf>,
-    /// Postgres run directory for Unix sockets (required if --postgres-bin-dir is set)
-    #[arg(long)]
-    postgres_run_dir: Option<PathBuf>,
-    /// Idle timeout in seconds before shutting down (default: 600)
-    #[arg(long, default_value = "600")]
-    idle_timeout_secs: u64,
+        /// Socket name for launchd activation
+        #[arg(short, long)]
+        socket_name: String,
+        /// Backend Unix socket path (required unless using managed Postgres)
+        #[arg(short, long)]
+        backend_socket: Option<PathBuf>,
+        /// Postgres binaries directory (enables managed Postgres mode)
+        #[arg(long)]
+        postgres_bin_dir: Option<PathBuf>,
+        /// Postgres data directory (required if --postgres-bin-dir is set)
+        #[arg(long)]
+        postgres_data_dir: Option<PathBuf>,
+        /// Postgres run directory for Unix sockets (required if --postgres-bin-dir is set)
+        #[arg(long)]
+        postgres_run_dir: Option<PathBuf>,
+        /// Idle timeout in seconds before shutting down (default: 600)
+        #[arg(long, default_value = "600")]
+        idle_timeout_secs: u64,
     },
 }
 
@@ -140,7 +139,7 @@ async fn run() -> anyhow::Result<()> {
                 postgres_run_dir,
                 idle_timeout_secs,
                 use_launchd: true, // Proxy subcommand is for launchd mode
-                port: None, // Port is managed by launchd
+                port: None,        // Port is managed by launchd
             };
             postgel::proxy::run_proxy(config).await?;
             Ok(())
@@ -158,13 +157,16 @@ async fn handle_project(cmd: ProjectCommands) -> anyhow::Result<()> {
             let registry = Registry::load()?;
 
             // Check if already linked
-            if let Some(_) = registry.get_link_by_path(root.path()) {
+            if registry.get_link_by_path(root.path()).is_some() {
                 eprintln!("Project already linked. Use 'postgel project unlink' to unlink first.");
                 return Ok(());
             }
 
             // Determine Postgres version
-            let pg_version = _config.postgres_version.as_deref().unwrap_or("postgresql@16");
+            let pg_version = _config
+                .postgres_version
+                .as_deref()
+                .unwrap_or("postgresql@16");
             eprintln!("Installing PostgreSQL {}...", pg_version);
 
             let pg_install = PgInstall::get_or_install(pg_version)?;
@@ -241,7 +243,10 @@ async fn handle_project(cmd: ProjectCommands) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Instance not found"))?;
 
             println!("Project root: {}", root.path().display());
-            println!("Linked instance: {} ({})", instance.display_name, instance.id.0);
+            println!(
+                "Linked instance: {} ({})",
+                instance.display_name, instance.id.0
+            );
             println!("PostgreSQL version: {}", instance.postgres_version);
             println!("Port: {}", instance.port);
             println!("Database: {}", link.db_name);
@@ -299,11 +304,11 @@ async fn handle_project(cmd: ProjectCommands) -> anyhow::Result<()> {
                 }
                 _ => {
                     anyhow::bail!("Unknown format: {}. Supported: sh, dotenv, json", format);
-        }
-    }
+                }
+            }
 
-    Ok(())
-}
+            Ok(())
+        }
         ProjectCommands::Unlink { destroy_instance } => {
             let cwd = std::env::current_dir()?;
             let root = ProjectRoot::find(&cwd)?;
@@ -475,7 +480,10 @@ async fn handle_instance(cmd: InstanceCommands) -> anyhow::Result<()> {
                 port: Some(instance.port),
             };
 
-            eprintln!("Running proxy in foreground mode on port {}...", instance.port);
+            eprintln!(
+                "Running proxy in foreground mode on port {}...",
+                instance.port
+            );
             postgel::proxy::run_proxy(config).await?;
             Ok(())
         }
@@ -490,7 +498,10 @@ async fn handle_instance(cmd: InstanceCommands) -> anyhow::Result<()> {
                 .collect();
 
             if !instance_links.is_empty() {
-                eprintln!("Warning: This instance is linked to {} project(s):", instance_links.len());
+                eprintln!(
+                    "Warning: This instance is linked to {} project(s):",
+                    instance_links.len()
+                );
                 for link in &instance_links {
                     eprintln!("  {}", link.project_path.display());
                 }
@@ -502,11 +513,11 @@ async fn handle_instance(cmd: InstanceCommands) -> anyhow::Result<()> {
                 io::stdout().flush()?;
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
-            if !input.trim().eq_ignore_ascii_case("y") {
-                eprintln!("Cancelled");
-                return Ok(());
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("Cancelled");
+                    return Ok(());
+                }
             }
-        }
 
             // Remove launchd service
             #[cfg(target_os = "macos")]
@@ -557,7 +568,7 @@ async fn handle_instance(cmd: InstanceCommands) -> anyhow::Result<()> {
             }
 
             eprintln!("Removed {} instance(s)", removed);
-    Ok(())
+            Ok(())
         }
     }
 }
@@ -582,7 +593,7 @@ fn find_available_port() -> anyhow::Result<u16> {
 
     // Try ports starting from 5432
     for port in 5432..65535 {
-        if let Ok(_) = TcpListener::bind(format!("127.0.0.1:{}", port)) {
+        if TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
             // Port is available
             return Ok(port);
         }

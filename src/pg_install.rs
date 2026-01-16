@@ -73,8 +73,7 @@ impl PgInstall {
 
     fn extract_bottle(bottle_path: &Path, install_dir: &PathBuf, version: &str) -> Result<Self> {
         eprintln!("Extracting bottle to {}...", install_dir.display());
-        fs::create_dir_all(install_dir)
-            .context("Failed to create install directory")?;
+        fs::create_dir_all(install_dir).context("Failed to create install directory")?;
 
         // Extract the tarball
         let output = Command::new("tar")
@@ -94,16 +93,14 @@ impl PgInstall {
         // Find the actual bin directory
         // Homebrew bottles typically extract to a versioned directory
         let mut bin_dir = None;
-        
+
         // Try the versioned path first
         let candidate = install_dir.join(format!("{}/bin", version));
         if candidate.exists() {
             bin_dir = Some(candidate);
         } else {
             // Try to find bin directory in extracted contents
-            for entry in fs::read_dir(install_dir)
-                .context("Failed to read install directory")?
-            {
+            for entry in fs::read_dir(install_dir).context("Failed to read install directory")? {
                 let entry = entry.context("Failed to read directory entry")?;
                 let path = entry.path();
                 if path.is_dir() {
@@ -116,9 +113,8 @@ impl PgInstall {
             }
         }
 
-        let bin_dir = bin_dir.ok_or_else(|| {
-            anyhow::anyhow!("Could not find bin directory in extracted bottle")
-        })?;
+        let bin_dir = bin_dir
+            .ok_or_else(|| anyhow::anyhow!("Could not find bin directory in extracted bottle"))?;
 
         // Fetch and extract dependencies
         eprintln!("Fetching dependencies...");

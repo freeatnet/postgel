@@ -41,15 +41,14 @@ pub async fn run_proxy(config: ProxyConfig) -> Result<()> {
         || config.postgres_data_dir.is_some()
         || config.postgres_run_dir.is_some();
 
-    if managed_postgres {
-        if config.postgres_bin_dir.is_none()
+    if managed_postgres
+        && (config.postgres_bin_dir.is_none()
             || config.postgres_data_dir.is_none()
-            || config.postgres_run_dir.is_none()
-        {
-            anyhow::bail!(
-                "--postgres-bin-dir, --postgres-data-dir, and --postgres-run-dir must all be provided together"
-            );
-        }
+            || config.postgres_run_dir.is_none())
+    {
+        anyhow::bail!(
+            "--postgres-bin-dir, --postgres-data-dir, and --postgres-run-dir must all be provided together"
+        );
     }
 
     let backend_path = config.backend_socket_path()?;
@@ -74,12 +73,11 @@ pub async fn run_proxy(config: ProxyConfig) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn run_proxy_launchd(
-    config: ProxyConfig,
-    backend_path: &'static str,
-) -> Result<()> {
-    let fds = raunch::activate_socket(&config.socket_name)
-        .context(format!("Failed to activate socket '{}'", config.socket_name))?;
+async fn run_proxy_launchd(config: ProxyConfig, backend_path: &'static str) -> Result<()> {
+    let fds = raunch::activate_socket(&config.socket_name).context(format!(
+        "Failed to activate socket '{}'",
+        config.socket_name
+    ))?;
 
     if fds.is_empty() {
         anyhow::bail!(
@@ -196,12 +194,9 @@ async fn run_proxy_launchd(
     Ok(())
 }
 
-async fn run_proxy_foreground(
-    config: ProxyConfig,
-    backend_path: &'static str,
-) -> Result<()> {
-    use tokio::net::TcpListener as TokioTcpListener;
+async fn run_proxy_foreground(config: ProxyConfig, backend_path: &'static str) -> Result<()> {
     use std::net::SocketAddr;
+    use tokio::net::TcpListener as TokioTcpListener;
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let active_connections = Arc::new(AtomicUsize::new(0));
@@ -376,13 +371,19 @@ async fn wait_for_postgres_ready(
 
         match output {
             Ok(output) if output.status.success() => {
-                eprintln!("Postgres readiness check succeeded (attempt {})", attempt + 1);
+                eprintln!(
+                    "Postgres readiness check succeeded (attempt {})",
+                    attempt + 1
+                );
                 return Ok(());
             }
             Ok(_) => {
                 attempt += 1;
                 if attempt.is_multiple_of(50) {
-                    eprintln!("Postgres not ready yet (attempt {}), continuing to poll...", attempt);
+                    eprintln!(
+                        "Postgres not ready yet (attempt {}), continuing to poll...",
+                        attempt
+                    );
                 }
             }
             Err(e) => {
@@ -442,7 +443,10 @@ async fn shutdown_postgres(pid: u32) {
 
     match signal::kill(nix_pid, Signal::SIGTERM) {
         Ok(()) => {
-            eprintln!("Sent SIGTERM to Postgres (PID {}), waiting up to 10 seconds...", pid);
+            eprintln!(
+                "Sent SIGTERM to Postgres (PID {}), waiting up to 10 seconds...",
+                pid
+            );
         }
         Err(e) => {
             eprintln!("Failed to send SIGTERM to Postgres (PID {}): {}", pid, e);
@@ -470,7 +474,10 @@ async fn shutdown_postgres(pid: u32) {
         }
     }
 
-    eprintln!("Postgres (PID {}) did not exit within timeout, sending SIGKILL", pid);
+    eprintln!(
+        "Postgres (PID {}) did not exit within timeout, sending SIGKILL",
+        pid
+    );
     match signal::kill(nix_pid, Signal::SIGKILL) {
         Ok(()) => {
             eprintln!("Sent SIGKILL to Postgres (PID {})", pid);
@@ -549,7 +556,10 @@ async fn idle_monitor(
             active_changed.notified().await;
         }
 
-        eprintln!("No active connections, starting {} second idle timer", idle_timeout_secs);
+        eprintln!(
+            "No active connections, starting {} second idle timer",
+            idle_timeout_secs
+        );
 
         tokio::select! {
             _ = sleep(Duration::from_secs(idle_timeout_secs)) => {
@@ -576,12 +586,18 @@ async fn handle_connection(
     let mut backend = match UnixStream::connect(backend_path).await {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("Error establishing upstream connection to {}: {}", backend_path, e);
+            eprintln!(
+                "Error establishing upstream connection to {}: {}",
+                backend_path, e
+            );
             return Ok(());
         }
     };
 
-    eprintln!("Proxy connection opened: client {} -> backend {}", client_addr, backend_path);
+    eprintln!(
+        "Proxy connection opened: client {} -> backend {}",
+        client_addr, backend_path
+    );
 
     let (mut client_read, mut client_write) = client.split();
     let (mut backend_read, mut backend_write) = backend.split();
@@ -601,23 +617,38 @@ async fn handle_connection(
 
     match client_copied {
         Ok(count) => {
-            eprintln!("Transferred {} bytes from client {} to backend", count, client_addr);
+            eprintln!(
+                "Transferred {} bytes from client {} to backend",
+                count, client_addr
+            );
         }
         Err(err) => {
-            eprintln!("Error writing bytes from client {} to backend: {}", client_addr, err);
+            eprintln!(
+                "Error writing bytes from client {} to backend: {}",
+                client_addr, err
+            );
         }
     }
 
     match backend_copied {
         Ok(count) => {
-            eprintln!("Transferred {} bytes from backend to client {}", count, client_addr);
+            eprintln!(
+                "Transferred {} bytes from backend to client {}",
+                count, client_addr
+            );
         }
         Err(err) => {
-            eprintln!("Error writing bytes from backend to client {}: {}", client_addr, err);
+            eprintln!(
+                "Error writing bytes from backend to client {}: {}",
+                client_addr, err
+            );
         }
     }
 
-    eprintln!("Proxy connection closed: client {} -> backend {}", client_addr, backend_path);
+    eprintln!(
+        "Proxy connection closed: client {} -> backend {}",
+        client_addr, backend_path
+    );
 
     Ok(())
 }

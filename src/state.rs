@@ -40,6 +40,12 @@ impl InstanceId {
     }
 }
 
+impl Default for InstanceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Link {
     pub id: LinkId,
@@ -59,22 +65,18 @@ impl LinkId {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl Default for LinkId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct RegistryData {
     instances: HashMap<InstanceId, Instance>,
     links: HashMap<LinkId, Link>,
     #[serde(default)]
     instance_by_path: HashMap<PathBuf, InstanceId>,
-}
-
-impl Default for RegistryData {
-    fn default() -> Self {
-        Self {
-            instances: HashMap::new(),
-            links: HashMap::new(),
-            instance_by_path: HashMap::new(),
-        }
-    }
 }
 
 pub struct Registry {
@@ -92,10 +94,9 @@ impl Registry {
         let registry_path = config_dir.join("registry.json");
 
         let data = if registry_path.exists() {
-            let contents = fs::read_to_string(&registry_path)
-                .context("Failed to read registry file")?;
-            serde_json::from_str(&contents)
-                .context("Failed to parse registry file")?
+            let contents =
+                fs::read_to_string(&registry_path).context("Failed to read registry file")?;
+            serde_json::from_str(&contents).context("Failed to parse registry file")?
         } else {
             RegistryData::default()
         };
@@ -108,10 +109,9 @@ impl Registry {
 
     fn save(&self) -> Result<()> {
         let data = self.data.read().unwrap();
-        let contents = serde_json::to_string_pretty(&*data)
-            .context("Failed to serialize registry")?;
-        fs::write(&self.registry_path, contents)
-            .context("Failed to write registry file")?;
+        let contents =
+            serde_json::to_string_pretty(&*data).context("Failed to serialize registry")?;
+        fs::write(&self.registry_path, contents).context("Failed to write registry file")?;
         Ok(())
     }
 
@@ -155,7 +155,8 @@ impl Registry {
     pub fn add_link(&self, link: Link) -> Result<()> {
         let mut data = self.data.write().unwrap();
         data.links.insert(link.id.clone(), link.clone());
-        data.instance_by_path.insert(link.project_path.clone(), link.instance_id.clone());
+        data.instance_by_path
+            .insert(link.project_path.clone(), link.instance_id.clone());
         drop(data);
         self.save()?;
         Ok(())
@@ -163,14 +164,12 @@ impl Registry {
 
     pub fn get_link_by_path(&self, path: &Path) -> Option<Link> {
         let data = self.data.read().unwrap();
-        data.instance_by_path
-            .get(path)
-            .and_then(|inst_id| {
-                data.links
-                    .values()
-                    .find(|link| link.instance_id == *inst_id && link.project_path == path)
-                    .cloned()
-            })
+        data.instance_by_path.get(path).and_then(|inst_id| {
+            data.links
+                .values()
+                .find(|link| link.instance_id == *inst_id && link.project_path == path)
+                .cloned()
+        })
     }
 
     pub fn list_links(&self) -> Vec<Link> {
@@ -195,10 +194,10 @@ impl Registry {
             .iter()
             .find(|(_, link)| link.project_path == path)
             .map(|(id, _)| id.clone());
-        if let Some(ref id) = link_id {
-            if let Some(link) = data.links.remove(id) {
-                data.instance_by_path.remove(&link.project_path);
-            }
+        if let Some(ref id) = link_id
+            && let Some(link) = data.links.remove(id)
+        {
+            data.instance_by_path.remove(&link.project_path);
         }
         drop(data);
         self.save()?;

@@ -14,17 +14,9 @@ pub enum ProjectError {
     WriteError(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
     pub postgres_version: Option<String>,
-}
-
-impl Default for ProjectConfig {
-    fn default() -> Self {
-        Self {
-            postgres_version: None,
-        }
-    }
 }
 
 pub struct ProjectRoot(PathBuf);
@@ -68,36 +60,32 @@ impl ProjectRoot {
         let config_path = self.config_path();
         if !config_path.exists() {
             let config = ProjectConfig::default();
-            let contents = toml::to_string_pretty(&config)
-                .context("Failed to serialize default config")?;
-            fs::write(&config_path, contents)
-                .context("Failed to write postgel.toml")?;
+            let contents =
+                toml::to_string_pretty(&config).context("Failed to serialize default config")?;
+            fs::write(&config_path, contents).context("Failed to write postgel.toml")?;
         }
         Ok(())
     }
 
     pub fn load_config(&self) -> Result<ProjectConfig> {
         let config_path = self.config_path();
-        let contents = fs::read_to_string(&config_path)
-            .context("Failed to read postgel.toml")?;
-        let config: ProjectConfig = toml::from_str(&contents)
-            .context("Failed to parse postgel.toml")?;
+        let contents = fs::read_to_string(&config_path).context("Failed to read postgel.toml")?;
+        let config: ProjectConfig =
+            toml::from_str(&contents).context("Failed to parse postgel.toml")?;
         Ok(config)
     }
 
     pub fn save_config(&self, config: &ProjectConfig) -> Result<()> {
         let config_path = self.config_path();
-        let contents = toml::to_string_pretty(config)
-            .context("Failed to serialize config")?;
-        fs::write(&config_path, contents)
-            .context("Failed to write postgel.toml")?;
+        let contents = toml::to_string_pretty(config).context("Failed to serialize config")?;
+        fs::write(&config_path, contents).context("Failed to write postgel.toml")?;
         Ok(())
     }
 
     pub fn generate_instance_name(&self) -> String {
+        use hex;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        use hex;
 
         let path_str = self.0.to_string_lossy();
         let mut hasher = DefaultHasher::new();
@@ -107,7 +95,8 @@ impl ProjectRoot {
         let short_hash = &hash_str[..8];
 
         // Try to derive a slug from the directory name
-        let slug = self.0
+        let slug = self
+            .0
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("project")

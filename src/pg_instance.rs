@@ -43,10 +43,8 @@ impl PgInstance {
             return Ok(());
         }
 
-        std::fs::create_dir_all(&self.data_dir)
-            .context("Failed to create data directory")?;
-        std::fs::create_dir_all(&self.run_dir)
-            .context("Failed to create run directory")?;
+        std::fs::create_dir_all(&self.data_dir).context("Failed to create data directory")?;
+        std::fs::create_dir_all(&self.run_dir).context("Failed to create run directory")?;
 
         let locale = std::env::var("LC_ALL")
             .or_else(|_| std::env::var("LANG"))
