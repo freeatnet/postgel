@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const PROXY_SOCKET_NAME: &str = "postgel-proxy";
+
 pub struct LaunchdService {
     label: String,
     plist_path: PathBuf,
@@ -21,7 +23,6 @@ impl LaunchdService {
     pub fn install(
         &self,
         binary_path: &Path,
-        socket_name: &str,
         postgres_bin_dir: &Path,
         postgres_data_dir: &Path,
         postgres_run_dir: &Path,
@@ -42,8 +43,6 @@ impl LaunchdService {
         let args = vec![
             binary_path.to_string_lossy().to_string(),
             "proxy".to_string(),
-            "--socket-name".to_string(),
-            socket_name.to_string(),
             "--postgres-bin-dir".to_string(),
             postgres_bin_dir.to_string_lossy().to_string(),
             "--postgres-data-dir".to_string(),
@@ -88,7 +87,7 @@ impl LaunchdService {
         socket_array.push(Value::Dictionary(ipv6_socket));
 
         let mut socket_dict = plist::Dictionary::new();
-        socket_dict.insert(socket_name.to_string(), Value::Array(socket_array));
+        socket_dict.insert(PROXY_SOCKET_NAME.to_string(), Value::Array(socket_array));
         dict.insert("Sockets".to_string(), Value::Dictionary(socket_dict));
 
         // RunAtLoad: false (don't start on login)

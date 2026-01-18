@@ -28,21 +28,15 @@ enum Commands {
     },
     /// Run the proxy (for launchd or foreground mode)
     Proxy {
-        /// Socket name for launchd activation
-        #[arg(short, long)]
-        socket_name: String,
-        /// Backend Unix socket path (required unless using managed Postgres)
-        #[arg(short, long)]
-        backend_socket: Option<PathBuf>,
-        /// Postgres binaries directory (enables managed Postgres mode)
+        /// Postgres binaries directory
         #[arg(long)]
-        postgres_bin_dir: Option<PathBuf>,
-        /// Postgres data directory (required if --postgres-bin-dir is set)
+        postgres_bin_dir: PathBuf,
+        /// Postgres data directory
         #[arg(long)]
-        postgres_data_dir: Option<PathBuf>,
-        /// Postgres run directory for Unix sockets (required if --postgres-bin-dir is set)
+        postgres_data_dir: PathBuf,
+        /// Postgres run directory for Unix sockets
         #[arg(long)]
-        postgres_run_dir: Option<PathBuf>,
+        postgres_run_dir: PathBuf,
         /// Idle timeout in seconds before shutting down (default: 600)
         #[arg(long, default_value = "600")]
         idle_timeout_secs: u64,
@@ -124,16 +118,12 @@ async fn run() -> anyhow::Result<()> {
         Commands::Project { command } => handle_project(command).await,
         Commands::Instance { command } => handle_instance(command).await,
         Commands::Proxy {
-            socket_name,
-            backend_socket,
             postgres_bin_dir,
             postgres_data_dir,
             postgres_run_dir,
             idle_timeout_secs,
         } => {
             let config = ProxyConfig {
-                socket_name,
-                backend_socket,
                 postgres_bin_dir,
                 postgres_data_dir,
                 postgres_run_dir,
@@ -470,11 +460,9 @@ async fn handle_instance(cmd: InstanceCommands) -> anyhow::Result<()> {
             pg_instance.initdb()?;
 
             let config = ProxyConfig {
-                socket_name: format!("postgel-{}", instance.id.0),
-                backend_socket: Some(pg_instance.socket_path()),
-                postgres_bin_dir: Some(pg_instance.bin_dir.clone()),
-                postgres_data_dir: Some(pg_instance.data_dir.clone()),
-                postgres_run_dir: Some(pg_instance.run_dir.clone()),
+                postgres_bin_dir: pg_instance.bin_dir.clone(),
+                postgres_data_dir: pg_instance.data_dir.clone(),
+                postgres_run_dir: pg_instance.run_dir.clone(),
                 idle_timeout_secs: 600,
                 use_launchd: false, // Foreground mode
                 port: Some(instance.port),
@@ -622,7 +610,6 @@ async fn enable_launchd_for_instance(
 
     service.install(
         &binary_path,
-        "postgres-proxy",
         &pg_install.bin_dir,
         &instance.data_dir,
         &instance.run_dir,

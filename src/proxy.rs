@@ -12,46 +12,25 @@ use tokio::process::Command;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::time::{Duration, sleep};
 
+const PROXY_SOCKET_NAME: &str = "postgel-proxy";
+
 pub struct ProxyConfig {
-    pub socket_name: String,
-    pub backend_socket: Option<PathBuf>,
-    pub postgres_bin_dir: Option<PathBuf>,
-    pub postgres_data_dir: Option<PathBuf>,
-    pub postgres_run_dir: Option<PathBuf>,
+    pub postgres_bin_dir: PathBuf,
+    pub postgres_data_dir: PathBuf,
+    pub postgres_run_dir: PathBuf,
     pub idle_timeout_secs: u64,
     pub use_launchd: bool,
     pub port: Option<u16>, // For foreground mode
 }
 
 impl ProxyConfig {
-    pub fn backend_socket_path(&self) -> Result<PathBuf> {
-        if let Some(ref path) = self.backend_socket {
-            Ok(path.clone())
-        } else if self.postgres_run_dir.is_some() {
-            let run_dir = self.postgres_run_dir.as_ref().unwrap();
-            Ok(run_dir.join(".s.PGSQL.5432"))
-        } else {
-            anyhow::bail!("--backend-socket is required when not using managed Postgres");
-        }
+    pub fn backend_socket_path(&self) -> PathBuf {
+        self.postgres_run_dir.join(".s.PGSQL.5432")
     }
 }
 
 pub async fn run_proxy(config: ProxyConfig) -> Result<()> {
-    let managed_postgres = config.postgres_bin_dir.is_some()
-        || config.postgres_data_dir.is_some()
-        || config.postgres_run_dir.is_some();
-
-    if managed_postgres
-        && (config.postgres_bin_dir.is_none()
-            || config.postgres_data_dir.is_none()
-            || config.postgres_run_dir.is_none())
-    {
-        anyhow::bail!(
-            "--postgres-bin-dir, --postgres-data-dir, and --postgres-run-dir must all be provided together"
-        );
-    }
-
-    let backend_path = config.backend_socket_path()?;
+    let backend_path = config.backend_socket_path();
     let backend_path_str = backend_path.to_string_lossy().to_string();
     let backend_path: &str = Box::leak(backend_path_str.into_boxed_str());
 
@@ -74,15 +53,13 @@ pub async fn run_proxy(config: ProxyConfig) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 async fn run_proxy_launchd(config: ProxyConfig, backend_path: &'static str) -> Result<()> {
-    let fds = raunch::activate_socket(&config.socket_name).context(format!(
-        "Failed to activate socket '{}'",
-        config.socket_name
-    ))?;
+    let fds = raunch::activate_socket(PROXY_SOCKET_NAME)
+        .context(format!("Failed to activate socket '{}'", PROXY_SOCKET_NAME))?;
 
     if fds.is_empty() {
         anyhow::bail!(
             "No file descriptors returned for socket '{}'",
-            config.socket_name
+            PROXY_SOCKET_NAME
         );
     }
 
@@ -91,62 +68,59 @@ async fn run_proxy_launchd(config: ProxyConfig, backend_path: &'static str) -> R
     let active_changed = Arc::new(Notify::new());
     let postgres_exited_unexpectedly = Arc::new(AtomicBool::new(false));
 
-    let mut postgres_child = None;
-    if config.postgres_bin_dir.is_some() {
-        let postgres_bin_dir = config.postgres_bin_dir.as_ref().unwrap();
-        let postgres_data_dir = config.postgres_data_dir.as_ref().unwrap();
-        let postgres_run_dir = config.postgres_run_dir.as_ref().unwrap();
+    let postgres_bin_dir = &config.postgres_bin_dir;
+    let postgres_data_dir = &config.postgres_data_dir;
+    let postgres_run_dir = &config.postgres_run_dir;
 
-        let postgres_bin = postgres_bin_dir.join("postgres");
-        let pg_isready_bin = postgres_bin_dir.join("pg_isready");
+    let postgres_bin = postgres_bin_dir.join("postgres");
+    let pg_isready_bin = postgres_bin_dir.join("pg_isready");
 
-        eprintln!("Starting managed Postgres instance...");
+    eprintln!("Starting managed Postgres instance...");
 
-        let locale = std::env::var("LC_ALL")
-            .or_else(|_| std::env::var("LANG"))
-            .unwrap_or_else(|_| "C".to_string());
+    let locale = std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .unwrap_or_else(|_| "C".to_string());
 
-        let child = Command::new(&postgres_bin)
-            .arg("-D")
-            .arg(postgres_data_dir)
-            .arg("-c")
-            .arg("listen_addresses=")
-            .arg("-c")
-            .arg(format!(
-                "unix_socket_directories={}",
-                postgres_run_dir.display()
-            ))
-            .arg("-k")
-            .arg(postgres_run_dir)
-            .env("LC_ALL", &locale)
-            .env("LANG", &locale)
-            .stderr(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .spawn()
-            .context("Failed to spawn Postgres")?;
+    let child = Command::new(&postgres_bin)
+        .arg("-D")
+        .arg(postgres_data_dir)
+        .arg("-c")
+        .arg("listen_addresses=")
+        .arg("-c")
+        .arg(format!(
+            "unix_socket_directories={}",
+            postgres_run_dir.display()
+        ))
+        .arg("-k")
+        .arg(postgres_run_dir)
+        .env("LC_ALL", &locale)
+        .env("LANG", &locale)
+        .stderr(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .spawn()
+        .context("Failed to spawn Postgres")?;
 
-        let pid = child.id().expect("Postgres child should have a PID");
-        eprintln!("Postgres started with PID {}", pid);
+    let pid = child.id().expect("Postgres child should have a PID");
+    eprintln!("Postgres started with PID {}", pid);
 
-        eprintln!("Waiting for Postgres to become ready...");
-        wait_for_postgres_ready(&pg_isready_bin, postgres_run_dir, shutdown_rx.clone()).await?;
-        eprintln!("Postgres is ready, starting to accept connections");
+    eprintln!("Waiting for Postgres to become ready...");
+    wait_for_postgres_ready(&pg_isready_bin, postgres_run_dir, shutdown_rx.clone()).await?;
+    eprintln!("Postgres is ready, starting to accept connections");
 
-        let postgres_supervisor_shutdown_rx = shutdown_rx.clone();
-        let postgres_supervisor_shutdown_tx = shutdown_tx.clone();
-        let postgres_supervisor_exited = postgres_exited_unexpectedly.clone();
-        tokio::spawn(async move {
-            supervise_postgres(
-                child,
-                postgres_supervisor_shutdown_rx,
-                postgres_supervisor_shutdown_tx,
-                postgres_supervisor_exited,
-            )
-            .await;
-        });
+    let postgres_supervisor_shutdown_rx = shutdown_rx.clone();
+    let postgres_supervisor_shutdown_tx = shutdown_tx.clone();
+    let postgres_supervisor_exited = postgres_exited_unexpectedly.clone();
+    tokio::spawn(async move {
+        supervise_postgres(
+            child,
+            postgres_supervisor_shutdown_rx,
+            postgres_supervisor_shutdown_tx,
+            postgres_supervisor_exited,
+        )
+        .await;
+    });
 
-        postgres_child = Some(pid);
-    }
+    let postgres_child = Some(pid);
 
     let idle_monitor_active = active_connections.clone();
     let idle_monitor_notify = active_changed.clone();
@@ -203,62 +177,59 @@ async fn run_proxy_foreground(config: ProxyConfig, backend_path: &'static str) -
     let active_changed = Arc::new(Notify::new());
     let postgres_exited_unexpectedly = Arc::new(AtomicBool::new(false));
 
-    let mut postgres_child = None;
-    if config.postgres_bin_dir.is_some() {
-        let postgres_bin_dir = config.postgres_bin_dir.as_ref().unwrap();
-        let postgres_data_dir = config.postgres_data_dir.as_ref().unwrap();
-        let postgres_run_dir = config.postgres_run_dir.as_ref().unwrap();
+    let postgres_bin_dir = &config.postgres_bin_dir;
+    let postgres_data_dir = &config.postgres_data_dir;
+    let postgres_run_dir = &config.postgres_run_dir;
 
-        let postgres_bin = postgres_bin_dir.join("postgres");
-        let pg_isready_bin = postgres_bin_dir.join("pg_isready");
+    let postgres_bin = postgres_bin_dir.join("postgres");
+    let pg_isready_bin = postgres_bin_dir.join("pg_isready");
 
-        eprintln!("Starting managed Postgres instance...");
+    eprintln!("Starting managed Postgres instance...");
 
-        let locale = std::env::var("LC_ALL")
-            .or_else(|_| std::env::var("LANG"))
-            .unwrap_or_else(|_| "C".to_string());
+    let locale = std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .unwrap_or_else(|_| "C".to_string());
 
-        let child = Command::new(&postgres_bin)
-            .arg("-D")
-            .arg(postgres_data_dir)
-            .arg("-c")
-            .arg("listen_addresses=")
-            .arg("-c")
-            .arg(format!(
-                "unix_socket_directories={}",
-                postgres_run_dir.display()
-            ))
-            .arg("-k")
-            .arg(postgres_run_dir)
-            .env("LC_ALL", &locale)
-            .env("LANG", &locale)
-            .stderr(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .spawn()
-            .context("Failed to spawn Postgres")?;
+    let child = Command::new(&postgres_bin)
+        .arg("-D")
+        .arg(postgres_data_dir)
+        .arg("-c")
+        .arg("listen_addresses=")
+        .arg("-c")
+        .arg(format!(
+            "unix_socket_directories={}",
+            postgres_run_dir.display()
+        ))
+        .arg("-k")
+        .arg(postgres_run_dir)
+        .env("LC_ALL", &locale)
+        .env("LANG", &locale)
+        .stderr(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .spawn()
+        .context("Failed to spawn Postgres")?;
 
-        let pid = child.id().expect("Postgres child should have a PID");
-        eprintln!("Postgres started with PID {}", pid);
+    let pid = child.id().expect("Postgres child should have a PID");
+    eprintln!("Postgres started with PID {}", pid);
 
-        eprintln!("Waiting for Postgres to become ready...");
-        wait_for_postgres_ready(&pg_isready_bin, postgres_run_dir, shutdown_rx.clone()).await?;
-        eprintln!("Postgres is ready, starting to accept connections");
+    eprintln!("Waiting for Postgres to become ready...");
+    wait_for_postgres_ready(&pg_isready_bin, postgres_run_dir, shutdown_rx.clone()).await?;
+    eprintln!("Postgres is ready, starting to accept connections");
 
-        let postgres_supervisor_shutdown_rx = shutdown_rx.clone();
-        let postgres_supervisor_shutdown_tx = shutdown_tx.clone();
-        let postgres_supervisor_exited = postgres_exited_unexpectedly.clone();
-        tokio::spawn(async move {
-            supervise_postgres(
-                child,
-                postgres_supervisor_shutdown_rx,
-                postgres_supervisor_shutdown_tx,
-                postgres_supervisor_exited,
-            )
-            .await;
-        });
+    let postgres_supervisor_shutdown_rx = shutdown_rx.clone();
+    let postgres_supervisor_shutdown_tx = shutdown_tx.clone();
+    let postgres_supervisor_exited = postgres_exited_unexpectedly.clone();
+    tokio::spawn(async move {
+        supervise_postgres(
+            child,
+            postgres_supervisor_shutdown_rx,
+            postgres_supervisor_shutdown_tx,
+            postgres_supervisor_exited,
+        )
+        .await;
+    });
 
-        postgres_child = Some(pid);
-    }
+    let postgres_child = Some(pid);
 
     // In foreground mode, bind to a TCP port
     let port = config.port.unwrap_or(5432);
