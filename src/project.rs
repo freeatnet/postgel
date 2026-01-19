@@ -8,6 +8,8 @@ use thiserror::Error;
 pub enum ProjectError {
     #[error("Project root not found")]
     RootNotFound,
+    #[error("Project config is missing postgres_version")]
+    MissingPostgresVersion,
     #[error("Failed to read postgel.toml: {0}")]
     ReadError(String),
     #[error("Failed to write postgel.toml: {0}")]
@@ -17,6 +19,20 @@ pub enum ProjectError {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
     pub postgres_version: Option<String>,
+}
+
+impl ProjectConfig {
+    pub fn new(postgres_version: String) -> Self {
+        Self {
+            postgres_version: Some(postgres_version),
+        }
+    }
+
+    pub fn require_postgres_version(&self) -> Result<String> {
+        self.postgres_version
+            .clone()
+            .ok_or_else(|| ProjectError::MissingPostgresVersion.into())
+    }
 }
 
 pub struct ProjectRoot(PathBuf);
@@ -36,16 +52,8 @@ impl ProjectRoot {
         Err(ProjectError::RootNotFound.into())
     }
 
-    pub fn find_or_create(start: &Path) -> Result<Self> {
-        match Self::find(start) {
-            Ok(root) => Ok(root),
-            Err(_) => {
-                // Create in current directory
-                let root = Self(start.to_path_buf());
-                root.ensure_config()?;
-                Ok(root)
-            }
-        }
+    pub fn from_path(path: PathBuf) -> Self {
+        Self(path)
     }
 
     pub fn path(&self) -> &Path {
@@ -54,17 +62,6 @@ impl ProjectRoot {
 
     pub fn config_path(&self) -> PathBuf {
         self.0.join("postgel.toml")
-    }
-
-    pub fn ensure_config(&self) -> Result<()> {
-        let config_path = self.config_path();
-        if !config_path.exists() {
-            let config = ProjectConfig::default();
-            let contents =
-                toml::to_string_pretty(&config).context("Failed to serialize default config")?;
-            fs::write(&config_path, contents).context("Failed to write postgel.toml")?;
-        }
-        Ok(())
     }
 
     pub fn load_config(&self) -> Result<ProjectConfig> {
@@ -80,31 +77,5 @@ impl ProjectRoot {
         let contents = toml::to_string_pretty(config).context("Failed to serialize config")?;
         fs::write(&config_path, contents).context("Failed to write postgel.toml")?;
         Ok(())
-    }
-
-    pub fn generate_instance_name(&self) -> String {
-        use hex;
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let path_str = self.0.to_string_lossy();
-        let mut hasher = DefaultHasher::new();
-        path_str.hash(&mut hasher);
-        let hash = hasher.finish();
-        let hash_str = hex::encode(hash.to_be_bytes());
-        let short_hash = &hash_str[..8];
-
-        // Try to derive a slug from the directory name
-        let slug = self
-            .0
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project")
-            .to_lowercase()
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-')
-            .collect::<String>();
-
-        format!("{}-{}", slug, short_hash)
     }
 }

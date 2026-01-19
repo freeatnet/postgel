@@ -29,21 +29,21 @@ Binary: `target/release/postgel`
 From your project root:
 
 ```bash
-postgel project init
+postgel project init my-project
 eval "$(postgel project env --format=sh)"
 psql
 ```
 
 What this does:
 - Creates `postgel.toml` if missing (portable marker/config; safe to commit).
-- Creates a **tool-managed Postgres instance** and links this working copy to it (non-portable).
-- Installs/enables a **LaunchAgent** on macOS by default (use `postgel project init --no-launchd` to skip).
+- Creates a **tool-managed Postgres instance** named by the slug and links this working copy to it (non-portable).
+- Installs/enables a **LaunchAgent** on macOS by default (use `postgel project init <slug> --no-launchd` to skip).
 
 ## Instance lifecycle (how the managed instance behaves)
 
 ### Initialization
 
-`postgel project init`:
+`postgel project init <slug>`:
 
 - Finds/creates the project root by locating/creating `postgel.toml`.
 - Creates a new instance with:
@@ -55,13 +55,13 @@ What this does:
 
 When launchd is enabled:
 
-- `launchd` owns the TCP port and starts `postgel proxy ...` on first connection attempt.
-- `postgel proxy` starts `postgres` (managed mode), waits for readiness, then proxies each TCP connection to Postgres’ unix socket.
+- `launchd` owns the TCP port and starts `postgel instance run <slug> --from-launchd` on first connection attempt.
+- `postgel instance run <slug> --from-launchd` starts `postgres` (managed mode), waits for readiness, then proxies each TCP connection to Postgres’ unix socket.
 - When active connections drop to zero, an idle timer starts; on expiry the proxy shuts down and Postgres is terminated.
 
 ### Running (foreground / Procfile-style)
 
-`postgel instance run <id-or-name>` runs the proxy in the foreground (no launchd):
+`postgel instance run <slug>` runs the proxy in the foreground (no launchd):
 
 - Binds the instance TCP port on `127.0.0.1:<port>`
 - Starts Postgres and proxies connections
@@ -70,33 +70,31 @@ When launchd is enabled:
 ### Unlinking / deleting / pruning
 
 - `postgel project unlink`: removes the project→instance link (instance remains unless `--destroy-instance`).
-- `postgel instance delete <id-or-name>`: removes LaunchAgent (if installed) and deletes instance directories; works even if the original project dir is gone.
-- `postgel project prune`: removes links whose project directories no longer exist.
-- `postgel instance prune`: removes instances with missing dirs; optionally remove orphaned instances via `--orphaned`.
+- `postgel instance delete <slug>`: removes LaunchAgent (if installed) and deletes instance directories; works even if the original project dir is gone.
+- `postgel projects prune`: removes links whose project directories no longer exist or whose instances are missing.
 
 ## CLI overview
 
 ### Project commands
 
-- `postgel project init [--no-launchd]`
+- `postgel project init <slug> [--pg-version <ver>] [--port <port>] [--no-launchd]`
+- `postgel project link <slug>`
 - `postgel project info`
 - `postgel project env --format=sh|dotenv|json` (stdout only)
 - `postgel project unlink [--destroy-instance]`
-- `postgel project prune`
-- `postgel project enable-launchd`
-- `postgel project disable-launchd`
 
 ### Instance commands
 
+- `postgel instance create <slug> [--pg-version <ver>] [--port <port>] [--no-launchd]`
 - `postgel instance list`
-- `postgel instance info <id-or-name>`
-- `postgel instance run <id-or-name>` (foreground proxy)
-- `postgel instance delete <id-or-name> [--force]`
-- `postgel instance prune [--orphaned]`
+- `postgel instance run <slug> [--from-launchd]`
+- `postgel instance env <slug> --format=sh|dotenv|json`
+- `postgel instance delete <slug>`
 
-### Proxy command
+### Projects commands
 
-`postgel proxy ...` is primarily intended to be started by `launchd` (socket activation). `postgel project init` manages this for you on macOS.
+- `postgel projects list`
+- `postgel projects prune`
 
 ## Where state is stored
 

@@ -4,7 +4,35 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::state::Instance;
+
+use super::ServiceManager;
+
 const PROXY_SOCKET_NAME: &str = "postgel-proxy";
+
+pub struct LaunchdManager;
+
+impl LaunchdManager {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ServiceManager for LaunchdManager {
+    fn install(&self, binary_path: &Path, instance: &Instance) -> Result<()> {
+        let label = launchd_label(instance);
+        let service = LaunchdService::new(label.clone());
+        service.install(binary_path, &instance.slug, instance.port)?;
+        eprintln!("Launchd service enabled: {}", label);
+        Ok(())
+    }
+
+    fn remove(&self, instance: &Instance) -> Result<()> {
+        let label = launchd_label(instance);
+        let service = LaunchdService::new(label);
+        service.remove()
+    }
+}
 
 pub struct LaunchdService {
     label: String,
@@ -19,38 +47,20 @@ impl LaunchdService {
         Self { label, plist_path }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn install(
-        &self,
-        binary_path: &Path,
-        postgres_bin_dir: &Path,
-        postgres_data_dir: &Path,
-        postgres_run_dir: &Path,
-        port: u16,
-        idle_timeout_secs: u64,
-    ) -> Result<()> {
-        // Create LaunchAgents directory if it doesn't exist
+    pub fn install(&self, binary_path: &Path, instance_slug: &str, port: u16) -> Result<()> {
         if let Some(parent) = self.plist_path.parent() {
             fs::create_dir_all(parent).context("Failed to create LaunchAgents directory")?;
         }
 
         let mut dict = plist::Dictionary::new();
-
-        // Label
         dict.insert("Label".to_string(), Value::String(self.label.clone()));
 
-        // ProgramArguments
         let args = vec![
             binary_path.to_string_lossy().to_string(),
-            "proxy".to_string(),
-            "--postgres-bin-dir".to_string(),
-            postgres_bin_dir.to_string_lossy().to_string(),
-            "--postgres-data-dir".to_string(),
-            postgres_data_dir.to_string_lossy().to_string(),
-            "--postgres-run-dir".to_string(),
-            postgres_run_dir.to_string_lossy().to_string(),
-            "--idle-timeout-secs".to_string(),
-            idle_timeout_secs.to_string(),
+            "instance".to_string(),
+            "run".to_string(),
+            instance_slug.to_string(),
+            "--from-launchd".to_string(),
         ];
 
         dict.insert(
@@ -58,10 +68,8 @@ impl LaunchdService {
             Value::Array(args.into_iter().map(Value::String).collect()),
         );
 
-        // Sockets
         let mut socket_array = Vec::new();
 
-        // IPv4 socket
         let mut ipv4_socket = plist::Dictionary::new();
         ipv4_socket.insert(
             "SockNodeName".to_string(),
@@ -75,7 +83,6 @@ impl LaunchdService {
         ipv4_socket.insert("SockFamily".to_string(), Value::String("IPv4".to_string()));
         socket_array.push(Value::Dictionary(ipv4_socket));
 
-        // IPv6 socket
         let mut ipv6_socket = plist::Dictionary::new();
         ipv6_socket.insert("SockNodeName".to_string(), Value::String("::1".to_string()));
         ipv6_socket.insert(
@@ -90,13 +97,9 @@ impl LaunchdService {
         socket_dict.insert(PROXY_SOCKET_NAME.to_string(), Value::Array(socket_array));
         dict.insert("Sockets".to_string(), Value::Dictionary(socket_dict));
 
-        // RunAtLoad: false (don't start on login)
         dict.insert("RunAtLoad".to_string(), Value::Boolean(false));
-
-        // KeepAlive: false (don't restart automatically)
         dict.insert("KeepAlive".to_string(), Value::Boolean(false));
 
-        // StandardOutPath and StandardErrorPath
         let log_dir = PathBuf::from("/tmp");
         dict.insert(
             "StandardOutPath".to_string(),
@@ -118,16 +121,12 @@ impl LaunchdService {
         );
 
         let plist = Value::Dictionary(dict);
-
-        // Write plist to file
         plist::to_file_xml(&self.plist_path, &plist).context("Failed to write plist file")?;
 
-        // Load the service
         self.load()
     }
 
     pub fn load(&self) -> Result<()> {
-        // Unload first if it exists
         let _ = self.unload();
 
         let output = Command::new("launchctl")
@@ -156,7 +155,6 @@ impl LaunchdService {
             Ok(output) if output.status.success() => Ok(()),
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // Ignore "no such service" errors
                 if stderr.contains("No such process") || stderr.contains("Could not find") {
                     Ok(())
                 } else {
@@ -174,8 +172,8 @@ impl LaunchdService {
         }
         Ok(())
     }
+}
 
-    pub fn plist_path(&self) -> &Path {
-        &self.plist_path
-    }
+fn launchd_label(instance: &Instance) -> String {
+    format!("dev.postgel.{}", instance.slug)
 }

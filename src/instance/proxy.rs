@@ -20,7 +20,7 @@ pub struct ProxyConfig {
     pub postgres_run_dir: PathBuf,
     pub idle_timeout_secs: u64,
     pub use_launchd: bool,
-    pub port: Option<u16>, // For foreground mode
+    pub port: Option<u16>,
 }
 
 impl ProxyConfig {
@@ -231,7 +231,6 @@ async fn run_proxy_foreground(config: ProxyConfig, backend_path: &'static str) -
 
     let postgres_child = Some(pid);
 
-    // In foreground mode, bind to a TCP port
     let port = config.port.unwrap_or(5432);
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
     let listener = TokioTcpListener::bind(addr).await?;
