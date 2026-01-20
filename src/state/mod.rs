@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod instances;
+pub mod postgres_versions;
 pub mod projects;
 
 pub use instances::Instance;
@@ -24,6 +25,7 @@ pub enum RegistryError {
 pub struct Registry {
     instances: instances::InstanceStore,
     projects: projects::ProjectStore,
+    postgres_versions: postgres_versions::PostgresVersionStore,
 }
 
 impl Registry {
@@ -33,13 +35,17 @@ impl Registry {
 
         let instances_path = config_dir.join("instances.json");
         let links_path = config_dir.join("links.json");
+        let postgres_versions_path = config_dir.join("postgres_versions.json");
 
         let instances = instances::InstanceStore::load(instances_path)?;
         let projects = projects::ProjectStore::load(links_path)?;
+        let postgres_versions =
+            postgres_versions::PostgresVersionStore::load(postgres_versions_path)?;
 
         Ok(Self {
             instances,
             projects,
+            postgres_versions,
         })
     }
 
@@ -84,6 +90,14 @@ impl Registry {
     pub fn prune_dead_links(&self) -> Result<Vec<LinkId>> {
         self.projects
             .prune_dead_links(|slug| self.instances.contains(slug))
+    }
+
+    pub fn add_postgres_version(&self, version: String, path: PathBuf) -> Result<()> {
+        self.postgres_versions.add(version, path)
+    }
+
+    pub fn get_postgres_path(&self, version: &str) -> Option<PathBuf> {
+        self.postgres_versions.get(version)
     }
 }
 

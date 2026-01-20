@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::state::Registry;
 
 pub const DEFAULT_PG_VERSION: &str = "18";
 
@@ -12,22 +12,15 @@ pub struct PostgresInstall {
 }
 
 impl PostgresInstall {
-    pub fn get_or_install(version: &str) -> Result<Self> {
+    pub fn get_or_install(registry: &Registry, version: &str) -> Result<Self> {
         let normalized = normalize_pg_version(version)?;
-        let dirs = ProjectDirs::from("dev", "postgel", "postgel")
-            .context("Failed to determine data directory")?;
-        let data_dir = dirs.data_dir();
-        let install_dir = data_dir.join("pg").join(&normalized);
-        let bin_dir = install_dir.join("bin");
+        let formula = formula_name(&normalized);
 
-        if bin_dir.exists() && bin_dir.join("postgres").exists() {
-            Ok(Self {
-                version: normalized.to_string(),
-                bin_dir,
-            })
-        } else {
-            Self::install(&normalized, &install_dir)
+        if let Some(existing) = Self::get(registry, &normalized)? {
+            return Ok(existing);
         }
+
+        Self::install(registry, &formula, &normalized)
     }
 
     pub fn pg_ctl_path(&self) -> PathBuf {
@@ -46,138 +39,127 @@ impl PostgresInstall {
         self.bin_dir.join("initdb")
     }
 
-    fn install(normalized: &str, install_dir: &PathBuf) -> Result<Self> {
-        let formula = Self::formula_name(normalized);
-        if install_dir.exists() && install_dir.join("bin").join("postgres").exists() {
-            let bin_dir = install_dir.join("bin");
+    fn get(registry: &Registry, normalized: &str) -> Result<Option<Self>> {
+        if let Some(prefix) = registry.get_postgres_path(normalized) {
+            // Registry entry exists - verify the installation
+            let bin_dir = verify_postgres_installation(&prefix).map_err(|e| {
+                anyhow::anyhow!(
+                    "PostgreSQL version {} is registered at {}, but {}",
+                    normalized,
+                    prefix.display(),
+                    e
+                )
+            })?;
+
+            return Ok(Some(Self {
+                version: normalized.to_string(),
+                bin_dir,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn install(registry: &Registry, formula: &str, normalized: &str) -> Result<Self> {
+        // Check brew availability before attempting install
+        brew_check()?;
+
+        // Resolve the prefix path (brew_prefix returns the path whether installed or not)
+        let prefix = brew_prefix(formula)?;
+
+        // Check if already installed via brew (but not in registry)
+        if let Ok(bin_dir) = verify_postgres_installation(&prefix) {
+            // Found installed version - add to registry
+            registry.add_postgres_version(normalized.to_string(), prefix.clone())?;
             return Ok(Self {
                 version: normalized.to_string(),
                 bin_dir,
             });
         }
 
-        eprintln!("Fetching PostgreSQL {} bottle from Homebrew...", formula);
-        let output = Command::new("brew")
-            .arg("fetch")
-            .arg("--force-bottle")
-            .arg(&formula)
-            .output()
-            .context("Failed to run brew fetch. Is Homebrew installed?")?;
+        // Not found - need to install
+        brew_install_formula(formula)?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("brew fetch failed: {}", stderr);
-        }
+        // Verify installation after brew install
+        let bin_dir = verify_postgres_installation(&prefix)?;
 
-        let cache_output = Command::new("brew")
-            .arg("--cache")
-            .arg(&formula)
-            .output()
-            .context("Failed to get brew cache path")?;
-
-        if !cache_output.status.success() {
-            anyhow::bail!("Failed to get brew cache path");
-        }
-
-        let cache_path = String::from_utf8_lossy(&cache_output.stdout)
-            .trim()
-            .to_string();
-
-        let bottle_path = if cache_path.ends_with(".tar.gz") {
-            PathBuf::from(cache_path)
-        } else {
-            for ext in &[".tar.gz", ".tar.xz"] {
-                let candidate = format!("{}{}", cache_path, ext);
-                if Path::new(&candidate).exists() {
-                    return Self::extract_bottle(
-                        Path::new(&candidate),
-                        install_dir,
-                        &formula,
-                        normalized,
-                    );
-                }
-            }
-            anyhow::bail!("Could not find bottle file for {}", formula);
-        };
-
-        Self::extract_bottle(&bottle_path, install_dir, &formula, normalized)
-    }
-
-    fn extract_bottle(
-        bottle_path: &Path,
-        install_dir: &PathBuf,
-        formula: &str,
-        normalized: &str,
-    ) -> Result<Self> {
-        eprintln!("Extracting bottle to {}...", install_dir.display());
-        fs::create_dir_all(install_dir).context("Failed to create install directory")?;
-
-        let output = Command::new("tar")
-            .arg("-xzf")
-            .arg(bottle_path)
-            .arg("-C")
-            .arg(install_dir)
-            .output()
-            .context("Failed to extract bottle")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Failed to extract bottle: {}", stderr);
-        }
-
-        let mut bin_dir = None;
-        let candidate = install_dir.join(format!("{}/bin", formula));
-        if candidate.exists() {
-            bin_dir = Some(candidate);
-        } else {
-            for entry in fs::read_dir(install_dir).context("Failed to read install directory")? {
-                let entry = entry.context("Failed to read directory entry")?;
-                let path = entry.path();
-                if path.is_dir() {
-                    let candidate = path.join("bin");
-                    if candidate.exists() {
-                        bin_dir = Some(candidate);
-                        break;
-                    }
-                }
-            }
-        }
-
-        let bin_dir = bin_dir
-            .ok_or_else(|| anyhow::anyhow!("Could not find bin directory in extracted bottle"))?;
-
-        eprintln!("Fetching dependencies...");
-        let deps_output = Command::new("brew")
-            .arg("deps")
-            .arg("--include-optional")
-            .arg("--skip-recommended")
-            .arg(formula)
-            .output()
-            .context("Failed to get dependencies")?;
-
-        if deps_output.status.success() {
-            let deps = String::from_utf8_lossy(&deps_output.stdout);
-            for dep in deps.lines() {
-                let dep = dep.trim();
-                if !dep.is_empty() {
-                    let _ = Command::new("brew")
-                        .arg("fetch")
-                        .arg("--force-bottle")
-                        .arg(dep)
-                        .output();
-                }
-            }
-        }
+        // Record in registry
+        registry.add_postgres_version(normalized.to_string(), prefix.clone())?;
 
         Ok(Self {
             version: normalized.to_string(),
             bin_dir,
         })
     }
+}
 
-    fn formula_name(normalized: &str) -> String {
-        format!("postgresql@{}", normalized)
+fn verify_postgres_installation(prefix: &Path) -> Result<PathBuf> {
+    let bin_dir = prefix.join("bin");
+    let postgres_binary = bin_dir.join("postgres");
+    if !bin_dir.is_dir() || !postgres_binary.exists() {
+        anyhow::bail!(
+            "PostgreSQL binary not found at {}",
+            postgres_binary.display()
+        );
     }
+
+    Ok(bin_dir)
+}
+
+fn formula_name(normalized: &str) -> String {
+    format!("postgresql@{}", normalized)
+}
+
+fn brew_check() -> Result<()> {
+    let output = Command::new("brew")
+        .arg("--version")
+        .output()
+        .context("Failed to run brew --version. Is Homebrew installed?")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Homebrew is not installed or not available in PATH. Please install Homebrew: https://brew.sh/"
+        );
+    }
+
+    Ok(())
+}
+
+fn brew_prefix(formula: &str) -> Result<PathBuf> {
+    let output = Command::new("brew")
+        .arg("--prefix")
+        .arg(formula)
+        .output()
+        .context("Failed to run brew --prefix. Is Homebrew installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "brew --prefix failed: {}. Is {} installed?",
+            stderr,
+            formula
+        );
+    }
+
+    let prefix_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(PathBuf::from(prefix_str))
+}
+
+fn brew_install_formula(formula: &str) -> Result<()> {
+    let output = Command::new("brew")
+        .arg("install")
+        .arg("--skip-link")
+        .arg("--skip-post-install")
+        .arg(formula)
+        .output()
+        .context("Failed to run brew install. Is Homebrew installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("brew install failed: {}", stderr);
+    }
+
+    Ok(())
 }
 
 pub fn normalize_pg_version(input: &str) -> Result<String> {
@@ -192,7 +174,14 @@ pub fn normalize_pg_version(input: &str) -> Result<String> {
         anyhow::bail!("Postgres version cannot be empty");
     }
 
-    if !normalized.chars().all(|c| c.is_ascii_digit() || c == '.') {
+    // Only accept major versions (no minor/patch versions)
+    if normalized.contains('.') {
+        anyhow::bail!(
+            "Postgres version must be a major version only (e.g., '18', not '18.1'). Homebrew does not support minor/patch version specifications."
+        );
+    }
+
+    if !normalized.chars().all(|c| c.is_ascii_digit()) {
         anyhow::bail!("Invalid Postgres version: {}", trimmed);
     }
 
@@ -211,9 +200,15 @@ mod tests {
     use super::{DEFAULT_PG_VERSION, normalize_pg_version, resolve_pg_version};
 
     #[test]
-    fn normalize_pg_version_accepts_numeric_versions() {
+    fn normalize_pg_version_accepts_major_versions() {
         assert_eq!(normalize_pg_version("18").unwrap(), "18");
-        assert_eq!(normalize_pg_version("16.1").unwrap(), "16.1");
+        assert_eq!(normalize_pg_version("16").unwrap(), "16");
+    }
+
+    #[test]
+    fn normalize_pg_version_rejects_minor_patch_versions() {
+        assert!(normalize_pg_version("16.1").is_err());
+        assert!(normalize_pg_version("18.2.3").is_err());
     }
 
     #[test]
@@ -233,6 +228,7 @@ mod tests {
         assert!(normalize_pg_version("postgresql@").is_err());
         assert!(normalize_pg_version("v15").is_err());
         assert!(normalize_pg_version("15-beta").is_err());
+        assert!(normalize_pg_version("15.1").is_err());
     }
 
     #[test]

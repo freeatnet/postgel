@@ -44,7 +44,7 @@ pub fn create_instance(registry: &Registry, request: CreateInstanceRequest) -> R
     let data_dir = instance_dir.join("data");
     let run_dir = instance_dir.join("run");
 
-    let pg_install = PostgresInstall::get_or_install(&postgres_version)?;
+    let pg_install = PostgresInstall::get_or_install(registry, &postgres_version)?;
     initdb(&pg_install, &data_dir, &run_dir)?;
 
     let instance = Instance {
@@ -74,7 +74,7 @@ pub fn create_instance(registry: &Registry, request: CreateInstanceRequest) -> R
 
 pub async fn run_instance(registry: &Registry, slug: &str, from_launchd: bool) -> Result<()> {
     let instance = find_instance_by_slug(registry, slug)?;
-    let pg_install = PostgresInstall::get_or_install(&instance.postgres_version)?;
+    let pg_install = PostgresInstall::get_or_install(registry, &instance.postgres_version)?;
     initdb(&pg_install, &instance.data_dir, &instance.run_dir)?;
 
     let config = ProxyConfig {
